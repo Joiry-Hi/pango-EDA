@@ -33,9 +33,22 @@ design -copy-from after_map -as gate A:top
 read_verilog -lib -nooverwrite +/pango/pango_lib.v
 
 equiv_make  -inames gold gate equiv
-equiv_simple
+#equiv_simple
 #equiv_induct equiv
-equiv_status -assert equiv  
+#equiv_status -assert equiv  
+
+# 告诉Yosys接下来的等价性检查任务请使用ABC引擎来完成
+equiv_using -abc
+
+# ABC足够强大，有时可以替代或增强equiv_simple
+# 你可以只用 a.，或者用 b. (更强力)
+# a. 直接用 equiv_simple，但它会通过ABC运行
+equiv_simple 
+
+# b. (推荐) 使用专门为ABC设计的更强命令 equiv_prove
+# equiv_prove
+
+equiv_status -assert equiv
 
 #score -before design_20.v -after demo_after_syn.v
 

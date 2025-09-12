@@ -368,7 +368,6 @@ void StitcherMain(Module *module, const std::string &dump_filename)
 	auto start_time = std::chrono::high_resolution_clock::now();
 
 	log("Step 1: Scanning and collecting all GTP_LUTs...\n");
-	
 	SigMap sigmap(module);
 	vector<LutInfo> all_luts;
 	CollectLuts(module, sigmap, all_luts); 
@@ -388,7 +387,6 @@ void StitcherMain(Module *module, const std::string &dump_filename)
 	auto end_time = std::chrono::high_resolution_clock::now();
 	std::chrono::duration<double, std::milli> elapsed_ms = end_time - start_time;
 	log("Whole process took %.2f ms.\n", all_luts.size(), elapsed_ms.count());
-
 }
 
 struct StitcherPass : public Pass {
