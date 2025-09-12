@@ -3,7 +3,7 @@ EDA挑战赛
 
 clone下来后修改文件夹名为pango，直接替换pango文件夹
 
-之后在yosys根目录打开命令行终端（make clean可选）输入make -j(nproc)重新编译yosys，之后输入sudo make install进行安装
+之后在yosys根目录打开命令行终端（make clean可选）输入make -j$(nproc)重新编译yosys，之后输入sudo make install进行安装
 
 基础题代码在stitcher_pango.cc中，进阶题代码在mapper_pango.cc中
 

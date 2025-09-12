@@ -1,7 +1,7 @@
 # ---------------------------------------------
 # synthesis using synth_pango.cc 
-read_verilog -icells design_15.v
-hierarchy  -top design_15
+read_verilog -icells design_3.v
+hierarchy  -top design_3
 flatten
 design -save before_map
 
@@ -9,20 +9,20 @@ design -save before_map
 # could replaced by synth_pango script pass
 mapper 
 check -mapped
-write_verilog  -noattr -noexpr demo_after_syn.v
+write_verilog  -noattr -noexpr demo_after_syn_3.v
 
 # ---------------------------------------------
 # using internal cell type to verify 
 # --------process gate -------
 read_verilog -icells +/pango/pango_sim.v
-hierarchy -top design_15
+hierarchy -top design_3
 flatten 
 design -stash after_map
 
 # --------process gold -------
 design -load before_map
 read_verilog -icells +/pango/pango_sim.v
-hierarchy -top design_15
+hierarchy -top design_3
 flatten 
 design -stash before_map
 
@@ -37,5 +37,5 @@ equiv_simple
 #equiv_induct equiv
 equiv_status -assert equiv  
 
-#score -before design_15.v -after demo_after_syn.v
+#score -before design_3.v -after demo_after_syn.v
 

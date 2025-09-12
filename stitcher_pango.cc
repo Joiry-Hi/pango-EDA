@@ -361,21 +361,17 @@ void PerformMerges(Module *module, vector<LutInfo> &luts, priority_queue<MergeCa
 }
 
 // =================================================================
-// 主控函数 StitcherMain 现在变得像一份清晰的“食谱”
+// Main函数: 调用各步骤对应函数
 // =================================================================
-
 void StitcherMain(Module *module, const std::string &dump_filename)
 {
-	log("Step 1: Scanning and collecting all GTP_LUTs...\n");
 	auto start_time = std::chrono::high_resolution_clock::now();
 
+	log("Step 1: Scanning and collecting all GTP_LUTs...\n");
+	
 	SigMap sigmap(module);
 	vector<LutInfo> all_luts;
-	CollectLuts(module, sigmap, all_luts); // <--- 调用步骤1的函数
-
-	auto end_time = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double, std::milli> elapsed_ms = end_time - start_time;
-	log("Found %zu GTP_LUTs to process. Data extraction took %.2f ms.\n", all_luts.size(), elapsed_ms.count());
+	CollectLuts(module, sigmap, all_luts); 
 
 	if (!dump_filename.empty()) {
 		dump_luts_to_file(dump_filename, all_luts);
@@ -383,16 +379,17 @@ void StitcherMain(Module *module, const std::string &dump_filename)
 
 	log("Step 2: Finding best pairs to merge...\n");
 	priority_queue<MergeCandidate> candidates;
-	FindMergeCandidates(all_luts, candidates); // <--- 调用步骤2的函数
+	FindMergeCandidates(all_luts, candidates); 
 	log("Found %zu potential merge candidates.\n", candidates.size());
 
 	log("Step 3: Performing merges...\n");
-	PerformMerges(module, all_luts, candidates); // <--- 调用步骤3的函数
-}
+	PerformMerges(module, all_luts, candidates); 
 
-// =================================================================
-// StitcherPass 现在变得非常简洁
-// =================================================================
+	auto end_time = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double, std::milli> elapsed_ms = end_time - start_time;
+	log("Whole process took %.2f ms.\n", all_luts.size(), elapsed_ms.count());
+
+}
 
 struct StitcherPass : public Pass {
 	StitcherPass() : Pass("stitcher", "Basic Task: find and stitch GTP_LUTs.") {}
