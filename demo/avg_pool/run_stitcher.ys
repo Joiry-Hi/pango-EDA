@@ -1,0 +1,12 @@
+# run_stitcher_with_dump.ys
+
+# 读入一个已经映射好的、只包含GTP_LUT的网表
+read_verilog -icells demo_after_syn.v
+hierarchy -top avg_pool
+
+# 调用你的命令，并告诉它将LutInfo数组的内容
+# dump到名为 "lut_info_dump.txt" 的文件中
+stitcher -dump lut_info_dump.txt
+
+# 写出结果
+# write_verilog stitched.v

@@ -1,0 +1,58 @@
+图的表示 (Graph Representation)
+这些数据结构共同在内存中构建了电路的邻接表表示，是所有图遍历算法的基础。
+
+dict<SigBit, Cell *> bit2driver;
+    类型: 字典 (信号 -> 单元指针)
+    作用: 信号的来源。给定任何一根信号线(SigBit)，可以**O(1)或O(log N)**的效率快速查到是哪个单元(Cell *)**产生(驱动)**了它。一个信号只可能有一个驱动者。
+    填充于: CheckCellWidth()
+dict<SigBit, vector<Cell *>> bit2reader;
+    类型: 字典 (信号 -> 单元指针的列表)
+    作用: 信号的去向。给定任何一根信号线(SigBit)，可以快速查到**所有读取(使用)**了该信号的单元(Cell *)的列表。一个信号可以被多个单元读取。
+    填充于: CheckCellWidth()
+dict<Cell *, vector<SigBit>> cell2bits;
+    类型: 字典 (单元指针 -> 信号的列表)
+    作用: 单元的引脚。给定任何一个单元(Cell *)，可以获取它所有引脚信号的列表。代码中的约定是输出信号在前，输入信号在后。
+    填充于: CheckCellWidth()
+SigMap sigmap;
+    类型: Yosys内置的信号映射工具
+    作用: 信号规范化。解决信号的“别名”问题，确保逻辑上连通的信号线在所有数据结构中都使用唯一的标识符。
+    填充于: MapperInit()
+
+割集与逻辑锥 (Cuts and Logic Cones)
+这些数据结构用于存储和管理技术映射的“候选方案”。
+
+dict<Cell *, dict<pool<SigBit>, pool<Cell *>>> cell2cuts;
+    类型: 嵌套的字典 (单元 -> (割集 -> 逻辑锥))
+    作用: 候选方案手册。这是GenerateCuts预计算阶段的最终产物。
+    外层字典的键(Cell *)是要映射的逻辑门。
+    内层字典的键(pool<SigBit>)是实现该逻辑门的一种可能的割集（一组输入信号）。
+    内层字典的值(pool<Cell *>)是该割集对应的逻辑锥（一组上游逻辑门）。
+    填充于: GenerateCuts(Cell *cell)
+dict<SigBit, pool<SigBit>> best_bit2cut;
+    类型: 字典 (输出信号 -> 割集)
+    作用: 最终蓝图。在所有迭代优化完成后，这个字典存储了为每一个需要被映射的逻辑输出(SigBit)所选择的最终、最优的割集(pool<SigBit>)。ConeToLUTs函数根据这个“蓝图”来生成最终的LUT电路。
+    填充于: 在MapperMain的迭代循环中，通过比较每一轮的结果来更新。
+
+算法状态与成本 (Algorithm State & Costs)
+这些数据结构存储了mapper算法在迭代过程中用于启发式决策的成本信息和中间状态。
+
+dict<SigBit, float> bit2depth;
+    类型: 字典 (信号 -> 浮点数)
+    作用: 时序成本(深度)。存储每个信号(SigBit)从主输入到当前位置所经过的逻辑级数。这是GetBestCut进行时序评估的关键指标。
+    填充/更新于: TraverseFWD()
+dict<SigBit, float> bit2af;
+    类型: 字典 (信号 -> 浮点数)
+    作用: 面积成本(面积流)。存储一个启发式的值，用于预测实现某个信号(SigBit)最终会消耗的硬件面积。这是GetBestCut进行面积评估的关键指标。
+    填充/更新于: TraverseFWD()
+dict<SigBit, float> bit2height;
+    类型: 字典 (信号 -> 浮点数)
+    作用: 时序成本(高度)。存储每个信号(SigBit)到主输出的最长逻辑级数。它与bit2depth共同构成了面积优化时的深度约束。
+    填充/更新于: TraverseBWD()
+dict<Cell *, float> cell2OptDepth;
+    类型: 字典 (单元 -> 浮点数)
+    作用: 深度约束。存储在第一轮深度优先优化后，每个单元(Cell *)所能达到的最优深度。在后续的面积优化迭代中，任何选择的割集都不能超过这个深度限制。
+    填充于: MapperMain中，在第一次迭代结束后。
+dict<SigBit, size_t> bit2fanout_est;
+    类型: 字典 (信号 -> 整数)
+    作用: 扇出估计。存储对每个信号(SigBit)在映射后的扇出数量的估计值。这个值用于计算bit2af（面积流），因为面积成本需要被扇出平摊。
+    填充/更新于: MapperMain（初始化）和 TraverseBWD()（修正）。

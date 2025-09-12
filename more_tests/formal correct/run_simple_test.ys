@@ -1,0 +1,45 @@
+# run_simple_test.ys - Verification script for simple_design.v
+
+# ---------------------------------------------
+# 1. Synthesis using your mapper
+# ---------------------------------------------
+# We need -icells because the input already contains GTP primitives (DFFs, INBUFs)
+read_verilog -icells simple_design.v
+
+hierarchy  -top simple_design
+flatten
+design -save before_map
+
+# Run your mapper!
+# It should only process the $_AND_, $_XOR_, $_OR_, $_NOT_ cells.
+mapper 
+        
+check -mapped
+write_verilog -noattr -noexpr simple_design_after_syn.v
+
+# ---------------------------------------------
+# 2. Prepare for verification
+# ---------------------------------------------
+# Process 'gate' (your result)
+read_verilog -icells +/pango/pango_sim.v
+hierarchy -top simple_design
+flatten 
+design -stash after_map
+
+# Process 'gold' (the original)
+design -load before_map
+read_verilog -icells +/pango/pango_sim.v
+hierarchy -top simple_design
+flatten 
+design -stash before_map
+
+# ---------------------------------------------
+# 3. Equivalence Check
+# ---------------------------------------------
+design -copy-from before_map  -as gold A:top
+design -copy-from after_map -as gate A:top
+read_verilog -lib -nooverwrite +/pango/pango_lib.v
+
+equiv_make  -inames gold gate equiv
+equiv_simple
+equiv_status -assert equiv

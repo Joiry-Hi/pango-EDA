@@ -1,0 +1,426 @@
+#include "kernel/celltypes.h"
+#include "kernel/consteval.h"
+#include "kernel/modtools.h"
+#include "kernel/rtlil.h"
+#include "kernel/sigtools.h"
+#include "kernel/yosys.h"
+#include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <queue>
+#include <ranges>
+#include <string.h>
+#include <vector>
+
+USING_YOSYS_NAMESPACE
+using namespace std;
+PRIVATE_NAMESPACE_BEGIN
+
+// LutInfo 结构体保持不变
+struct LutInfo {
+	RTLIL::Cell *cell_ptr = nullptr;
+	int size = 0;
+	// 使用 map 来存储有序的、带端口名的输入
+	map<string, SigBit> ordered_inputs;
+	SigBit output;
+	RTLIL::Const init_val;
+	bool is_merged = false;
+};
+
+#pragma region tool_funcs
+// =================================================================
+// 新增的辅助函数
+// =================================================================
+// 注意：我们需要稍微修改一下打印函数，让它可以接受一个文件流作为参数
+
+// 最终、最可靠的格式化函数
+
+string format_init_hex(const RTLIL::Const &init_val)
+{
+	int width = GetSize(init_val);
+	if (width == 0) {
+		return "0";
+	}
+
+	// 创建一个非const的拷贝
+	RTLIL::Const val_copy = init_val;
+
+	string bin_str;
+	bin_str.reserve(width);
+
+	// 从高位到低位构建二进制字符串
+	for (int i = width - 1; i >= 0; i--) {
+		// --- 核心修正：使用 val_copy.bits().at(i) ---
+		// 先调用 bits() 获得 vector 的引用，然后用 .at(i) 访问
+		if (val_copy.bits().at(i) == RTLIL::S1) {
+			bin_str += '1';
+		} else if (val_copy.bits().at(i) == RTLIL::S0) {
+			bin_str += '0';
+		} else {
+			bin_str += 'x';
+		}
+	}
+
+	// ... (后续的二进制到十六进制转换逻辑保持不变) ...
+	while (bin_str.length() % 4 != 0) {
+		bin_str.insert(0, "0");
+	}
+
+	string hex_str;
+	const char hex_chars[] = "0123456789abcdef";
+
+	for (size_t i = 0; i < bin_str.length(); i += 4) {
+		int nibble = 0;
+		string group = bin_str.substr(i, 4);
+		if (group[0] == '1')
+			nibble += 8;
+		if (group[1] == '1')
+			nibble += 4;
+		if (group[2] == '1')
+			nibble += 2;
+		if (group[3] == '1')
+			nibble += 1;
+		hex_str += hex_chars[nibble];
+	}
+
+	// 1. 检查十六进制字符串长度是否为16
+	if (hex_str.length() == 16) {
+		// 2. 在索引位置8（即第9个字符的位置，从0开始计数）插入下划线
+		hex_str.insert(8, "_");
+	}
+
+	if (hex_str.empty()) {
+		return "0";
+	}
+
+	return hex_str;
+}
+
+// 修改后的打印函数
+void print_lut_info_to_stream(ostream &f, const LutInfo &info)
+{
+	f << "  - Cell: " << log_id(info.cell_ptr->name) << " (Type: " << log_id(info.cell_ptr->type) << ", Size: " << info.size << ")\n";
+	f << "    Output: " << log_signal(info.output) << "\n";
+
+	// --- 修改在这里 ---
+	// 遍历有序字典，打印出端口名和对应的信号
+	f << "    Inputs:\n";
+	for (const auto &pair : info.ordered_inputs) {
+		f << "      ." << pair.first << ": " << log_signal(pair.second) << "\n";
+	}
+
+	string init_hex_str = format_init_hex(info.init_val);
+	f << "    INIT: " << GetSize(info.init_val) << "'h" << init_hex_str << "\n";
+	f << "    INIT: " << GetSize(info.init_val) << "'b" << info.init_val.as_string() << "\n\n";
+}
+
+void dump_luts_to_file(const string &filename, const vector<LutInfo> &luts)
+{
+	ofstream f(filename);
+	if (!f.is_open()) {
+		log_error("Could not open file '%s' for writing.\n", filename.c_str());
+		return;
+	}
+
+	f << "--- Dump of all collected LUTs (" << luts.size() << " total) ---\n\n";
+	for (const auto &lut : luts) {
+		print_lut_info_to_stream(f, lut);
+	}
+	f << "--- End of LUT dump ---\n";
+	log("Successfully dumped LUT info to '%s'.\n", filename.c_str());
+}
+#pragma endregion tool_funcs
+
+// =================================================================
+// 最终修正版的 INIT 计算函数
+// =================================================================
+RTLIL::Const calculate_new_init(const LutInfo &lut_a, const LutInfo &lut_b, const vector<SigBit> &new_inputs, const SigBit &sel_bit,
+				bool sel_inverts_a, SigBit &z_out_sig, SigBit &z5_out_sig)
+{
+	const LutInfo &lut_for_z5 = sel_inverts_a ? lut_a : lut_b;
+	const LutInfo &lut_for_z_sel1 = sel_inverts_a ? lut_b : lut_a;
+	z5_out_sig = lut_for_z5.output;
+	z_out_sig = lut_a.output == z5_out_sig ? lut_b.output : lut_a.output; // Z输出连接到另一个
+
+	map<SigBit, int> new_input_map;
+	for (size_t i = 0; i < new_inputs.size(); ++i) {
+		new_input_map[new_inputs[i]] = i;
+	}
+
+	// 创建非const拷贝以访问 .bits()
+	LutInfo lut_for_z5_copy = lut_for_z5;
+	LutInfo lut_for_z_sel1_copy = lut_for_z_sel1;
+
+	vector<SigBit> shared_inputs;
+	int sel_idx = -1;
+	for (size_t i = 0; i < new_inputs.size(); ++i) {
+		if (new_inputs[i] == sel_bit) {
+			sel_idx = i;
+		} else {
+			shared_inputs.push_back(new_inputs[i]);
+		}
+	}
+	// 为了使能6输入，选择信号必须存在
+	log_assert(sel_idx != -1);
+	while (shared_inputs.size() < 5)
+		shared_inputs.push_back(RTLIL::Sx); // 补齐到5个共享输入
+
+	RTLIL::Const z_lut_init(RTLIL::S0, 32);
+	RTLIL::Const z5_lut_init(RTLIL::S0, 32);
+
+	// 计算 Z5 (luta) 的 32-bit INIT
+	for (int i = 0; i < 32; ++i) {
+		unsigned int addr_a = 0;
+		int bit_pos = 1;
+		for (const auto &pair : lut_for_z5_copy.ordered_inputs) {
+			auto it = find(shared_inputs.begin(), shared_inputs.end(), pair.second);
+			if (it != shared_inputs.end()) {
+				int shared_idx = distance(shared_inputs.begin(), it);
+				if ((i >> shared_idx) & 1) {
+					addr_a += bit_pos;
+				}
+			}
+			bit_pos <<= 1;
+		}
+		if (lut_for_z5_copy.init_val.bits().at(addr_a) == RTLIL::S1) {
+			z5_lut_init.bits().at(i) = RTLIL::S1;
+		}
+	}
+
+	// 计算 Z 在 sel=1 时的 32-bit INIT (lutb)
+	for (int i = 0; i < 32; ++i) {
+		unsigned int addr_b = 0;
+		int bit_pos = 1;
+		for (const auto &pair : lut_for_z_sel1_copy.ordered_inputs) {
+			auto it = find(shared_inputs.begin(), shared_inputs.end(), pair.second);
+			if (it != shared_inputs.end()) {
+				int shared_idx = distance(shared_inputs.begin(), it);
+				if ((i >> shared_idx) & 1) {
+					addr_b += bit_pos;
+				}
+			}
+			bit_pos <<= 1;
+		}
+		if (lut_for_z_sel1_copy.init_val.bits().at(addr_b) == RTLIL::S1) {
+			z_lut_init.bits().at(i) = RTLIL::S1;
+		}
+	}
+
+	// 将两个32-bit INIT合并成一个64-bit的GTP_LUT6D INIT
+	// 格式: {INIT_Z (高32位), INIT_Z5 (低32位)}
+	vector<RTLIL::State> final_init_bits = z5_lut_init.bits();
+	final_init_bits.insert(final_init_bits.end(), z_lut_init.bits().begin(), z_lut_init.bits().end());
+
+	return RTLIL::Const(final_init_bits);
+}
+
+// =================================================================
+// 步骤 1: 提取所有GTP_LUT的信息
+// =================================================================
+void CollectLuts(Module *module, SigMap &sigmap, vector<LutInfo> &luts)
+{
+	luts.clear();
+	for (Cell *cell : module->cells()) {
+		const char *type_str = cell->type.c_str();
+		if (strncmp(type_str, "\\GTP_LUT", 8) == 0 && strlen(type_str) == 9) {
+			LutInfo info;
+			info.cell_ptr = cell;
+			info.size = type_str[8] - '0';
+
+			// ---  修改在这里 ---
+			// 按照端口名 I0, I1, ... 顺序提取输入
+			for (int i = 0; i < info.size; ++i) {
+				string port_name = "I" + to_string(i);
+				IdString port_id = IdString("\\" + port_name); // Yosys内部端口名通常带'\'
+
+				if (cell->hasPort(port_id)) {
+					// 将 (端口名, 信号) 存入有序字典
+					info.ordered_inputs[port_name] = sigmap(cell->getPort(port_id));
+				}
+			}
+
+			info.output = sigmap(cell->getPort(ID(Z)));
+			info.init_val = cell->getParam(ID(INIT));
+			all_luts.push_back(info);
+		}
+	}
+}
+
+// =================================================================
+// 步骤 2: 寻找并评估所有可合并的候选对
+// =================================================================
+struct MergeCandidate {
+	int idx_a, idx_b;
+	int score; // 分数越高越好
+	pool<SigBit> union_inputs;
+
+	bool operator<(const MergeCandidate &other) const
+	{
+		return score < other.score; // 用于优先队列
+	}
+};
+
+void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
+{
+	for (size_t i = 0; i < all_luts.size(); ++i) {
+		for (size_t j = i + 1; j < all_luts.size(); ++j) {
+			LutInfo &lut_a = all_luts[i];
+			LutInfo &lut_b = all_luts[j];
+
+			// 合并检查
+			pool<SigBit> current_union_inputs;
+			for (const auto &pair : lut_a.ordered_inputs)
+				current_union_inputs.insert(pair.second);
+			for (const auto &pair : lut_b.ordered_inputs)
+				current_union_inputs.insert(pair.second);
+
+			if (current_union_inputs.size() <= 6) {
+				// 计算分数：共享输入数 * 100 - 总输入数
+				int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
+				int score = shared_inputs * 100 - current_union_inputs.size();
+				candidates.push({(int)i, (int)j, score, current_union_inputs});
+			}
+		}
+	}
+}
+
+// =================================================================
+// 步骤 3: 执行合并操作
+// =================================================================
+void PerformMerges(Module *module, vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
+{
+    int merges_done = 0;
+	while (!candidates.empty()) {
+		MergeCandidate best_pair = candidates.top();
+		candidates.pop();
+
+		LutInfo &lut_a = all_luts[best_pair.idx_a];
+		LutInfo &lut_b = all_luts[best_pair.idx_b];
+
+		if (lut_a.is_merged || lut_b.is_merged) {
+			continue;
+		}
+
+		lut_a.is_merged = true;
+		lut_b.is_merged = true;
+		merges_done++;
+
+		vector<SigBit> new_inputs_vec;
+		for (const auto &sig : best_pair.union_inputs)
+			new_inputs_vec.push_back(sig);
+		while (new_inputs_vec.size() < 6)
+			new_inputs_vec.push_back(RTLIL::Sx);
+
+		// 智能地选择选择信号 (sel_bit)
+		// 找出只存在于一个LUT输入中的信号，它们是最佳选择信号
+		pool<SigBit> inputs_a, inputs_b;
+		for (const auto &p : lut_a.ordered_inputs)
+			inputs_a.insert(p.second);
+		for (const auto &p : lut_b.ordered_inputs)
+			inputs_b.insert(p.second);
+
+		SigBit sel_bit = RTLIL::Sx;
+		for (const auto &sig : new_inputs_vec) {
+			if (sig != RTLIL::Sx && (inputs_a.count(sig) != inputs_b.count(sig))) {
+				sel_bit = sig;
+				break;
+			}
+		}
+		if (sel_bit == RTLIL::Sx)
+			sel_bit = new_inputs_vec[0]; // 兜底
+
+		// 重新排列 new_inputs_vec, 将 sel_bit 放在最后 (I5)
+		auto sel_it = find(new_inputs_vec.begin(), new_inputs_vec.end(), sel_bit);
+		iter_swap(sel_it, new_inputs_vec.end() - 1);
+
+		SigBit z_out, z5_out;
+		RTLIL::Const new_init = calculate_new_init(lut_a, lut_b, new_inputs_vec, sel_bit, true, z_out, z5_out);
+
+		// --- 修复字符串拼接 ---
+		string new_name = string(log_id(lut_a.cell_ptr->name)) + "_" + string(log_id(lut_b.cell_ptr->name)) + "_merged";
+		Cell *new_lut = module->addCell(RTLIL::IdString(new_name), ID(GTP_LUT6D));
+
+		new_lut->setParam(ID::INIT, new_init);
+		for (size_t k = 0; k < 6; ++k) {
+			new_lut->setPort(IdString("\\I" + to_string(k)), new_inputs_vec[k]);
+		}
+
+		// --- 修复端口ID ---
+		new_lut->setPort(ID(Z), z_out);
+		new_lut->setPort(ID(Z5), z5_out);
+
+		module->remove(lut_a.cell_ptr);
+		module->remove(lut_b.cell_ptr);
+	}
+    log("Performed %d merges.\n", merges_done);
+}
+
+// =================================================================
+// 主控函数 StitcherMain 现在变得像一份清晰的“食谱”
+// =================================================================
+
+void StitcherMain(Module *module, const std::string &dump_filename)
+{
+    log("Step 1: Scanning and collecting all GTP_LUTs...\n");
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    SigMap sigmap(module);
+    vector<LutInfo> all_luts;
+    CollectLuts(module, sigmap, all_luts); // <--- 调用步骤1的函数
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed_ms = end_time - start_time;
+    log("Found %zu GTP_LUTs to process. Data extraction took %.2f ms.\n", all_luts.size(), elapsed_ms.count());
+
+    if (!dump_filename.empty()) {
+        dump_luts_to_file(dump_filename, all_luts);
+    }
+
+    log("Step 2: Finding best pairs to merge...\n");
+    priority_queue<MergeCandidate> candidates;
+    FindMergeCandidates(all_luts, candidates); // <--- 调用步骤2的函数
+    log("Found %zu potential merge candidates.\n", candidates.size());
+    
+    log("Step 3: Performing merges...\n");
+    PerformMerges(module, all_luts, candidates); // <--- 调用步骤3的函数
+}
+
+// =================================================================
+// StitcherPass 现在变得非常简洁
+// =================================================================
+
+struct StitcherPass : public Pass {
+	StitcherPass() : Pass("stitcher", "Basic Task: find and stitch GTP_LUTs.") {}
+
+	std::string dump_filename;
+	void clear_flags() override { dump_filename = ""; }
+
+	void execute(vector<string> args, RTLIL::Design *design) override
+	{
+		log_header(design, "Executing StitcherPass (Basic Task).\n");
+		clear_flags();
+
+		// 1. 解析命令行参数
+		size_t argidx;
+		for (argidx = 1; argidx < args.size(); argidx++) {
+			if (args[argidx] == "-dump" && argidx + 1 < args.size()) {
+				dump_filename = args[++argidx];
+				continue;
+			}
+			break;
+		}
+		extra_args(args, argidx, design);
+
+		// 2. 获取模块
+		Module *module = design->top_module();
+		if (module == nullptr)
+			log_cmd_error("No top module found.\n");
+
+		// 3. 调用核心算法
+		StitcherMain(module, dump_filename);
+
+		log("Stitching complete.\n");
+	}
+} StitcherPass;
+
+PRIVATE_NAMESPACE_END

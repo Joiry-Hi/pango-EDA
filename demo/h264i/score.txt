@@ -1,0 +1,4 @@
+cost : 775655
+max_level : 16
+num_of_luts : 33611
+num_of_pins : 170657

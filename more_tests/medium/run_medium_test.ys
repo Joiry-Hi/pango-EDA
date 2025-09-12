@@ -1,0 +1,39 @@
+# run_medium_test.ys
+# Verification script for the medium-sized design.
+
+# Stage 1: Synthesis
+read_verilog -icells medium_design.v
+hierarchy -top medium_design
+flatten
+design -save before_map
+
+# Run your mapper
+mapper
+
+check -mapped
+write_verilog -noattr -noexpr medium_design_after_syn.v
+
+# Stage 2: Verification Prep
+# ... (copy from run_simple_test.ys, just change 'simple_design' to 'medium_design')
+read_verilog -icells +/pango/pango_sim.v
+hierarchy -top medium_design
+#... etc ...
+design -stash after_map
+
+design -load before_map
+read_verilog -icells +/pango/pango_sim.v
+hierarchy -top medium_design
+#... etc ...
+design -stash before_map
+
+# Stage 3: Equivalence Check
+# ... (copy from run_simple_test.ys)
+design -copy-from before_map  -as gold A:top
+design -copy-from after_map -as gate A:top
+read_verilog -lib -nooverwrite +/pango/pango_lib.v
+
+equiv_make  -inames gold gate equiv
+equiv_simple
+equiv_status -assert equiv  
+
+log "SUCCESS: Equivalence check passed for medium_design!"

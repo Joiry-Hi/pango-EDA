@@ -1,0 +1,23 @@
+--- Dump of all collected LUTs (2 total) ---
+
+  - Cell: or_gate_lut (Type: GTP_LUT4, Size: 4)
+    Output: \combo_to_out1
+    Inputs:
+      .I0: \nt_in4
+      .I1: \dff2_q
+      .I2: \dff1_q
+      .I3: \nt_in3
+    INIT: 16'hf666
+
+    INIT: 16'b1111011001100110
+
+  - Cell: not_gate_lut (Type: GTP_LUT2, Size: 2)
+    Output: \combo_to_out2
+    Inputs:
+      .I0: \nt_in3
+      .I1: \dff1_q
+    INIT: 4'h7
+
+    INIT: 4'b0111
+
+--- End of LUT dump ---

@@ -1,0 +1,42 @@
+# ---------------------------------------------
+# synthesis using synth_pango.cc
+read_verilog -icells +/pango/pango_sim.v
+read_verilog -lib -nooverwrite +/pango/pango_lib.v
+design -stash pango_lib
+
+read_verilog -icells sm4_yosys_input.v
+hierarchy  -top sm4
+flatten
+design -save before_map
+
+# using mapper to run MapperMain function
+# could replaced by synth_pango script pass
+mapper
+check -mapped
+write_verilog -noattr -noexpr demo_after_syn.v
+
+# ---------------------------------------------
+# using internal cell type to verify 
+# --------process gate -------
+read_verilog -icells +/pango/pango_sim.v
+hierarchy -top sm4
+flatten 
+design -stash after_map
+
+# --------process gold -------
+design -load before_map
+read_verilog -icells +/pango/pango_sim.v
+hierarchy -top sm4
+flatten 
+design -stash before_map
+
+
+# ---------------build equiv netlist----------------
+design -copy-from before_map  -as gold A:top
+design -copy-from after_map -as gate A:top
+read_verilog -lib -nooverwrite +/pango/pango_lib.v
+
+equiv_make -inames gold gate equiv
+equiv_induct equiv
+equiv_status -assert equiv  
+

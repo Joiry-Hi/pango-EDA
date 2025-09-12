@@ -1,0 +1,42 @@
+# run_test.ys - Verification script for test_logic.v
+
+# ---------------------------------------------
+# 1. Synthesis using your mapper
+# ---------------------------------------------
+read_verilog -icells test_logic.v
+hierarchy  -top test_logic
+flatten
+design -save before_map
+
+# Run your mapper!
+mapper 
+
+check -mapped
+write_verilog -noattr -noexpr test_logic_after_syn.v
+
+# ---------------------------------------------
+# 2. Prepare for verification
+# ---------------------------------------------
+# Process 'gate' (your result)
+read_verilog -icells +/pango/pango_sim.v
+hierarchy -top test_logic
+flatten 
+design -stash after_map
+
+# Process 'gold' (the original)
+design -load before_map
+read_verilog -icells +/pango/pango_sim.v
+hierarchy -top test_logic
+flatten 
+design -stash before_map
+
+# ---------------------------------------------
+# 3. Equivalence Check
+# ---------------------------------------------
+design -copy-from before_map  -as gold A:top
+design -copy-from after_map -as gate A:top
+read_verilog -lib -nooverwrite +/pango/pango_lib.v
+
+equiv_make  -inames gold gate equiv
+equiv_simple
+equiv_status -assert equiv  
