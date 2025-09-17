@@ -132,86 +132,91 @@ void dump_luts_to_file(const string &filename, const vector<LutInfo> &luts)
 #pragma endregion tool_funcs
 
 // =================================================================
-// 最终修正版的 INIT 计算函数
+// 最终、最可靠的 INIT 计算函数 (已修复逻辑漏洞)
 // =================================================================
-RTLIL::Const calculate_new_init(const LutInfo &lut_a, const LutInfo &lut_b, const vector<SigBit> &new_inputs, const SigBit &sel_bit,
-				bool sel_inverts_a, SigBit &z_out_sig, SigBit &z5_out_sig)
-{
-	const LutInfo &lut_for_z5 = sel_inverts_a ? lut_a : lut_b;
-	const LutInfo &lut_for_z_sel1 = sel_inverts_a ? lut_b : lut_a;
-	z5_out_sig = lut_for_z5.output;
-	z_out_sig = lut_a.output == z5_out_sig ? lut_b.output : lut_a.output; // Z输出连接到另一个
+RTLIL::Const calculate_new_init(
+    const LutInfo &lut_a,
+    const LutInfo &lut_b,
+    const vector<SigBit> &new_inputs_vec,
+    const SigBit &sel_bit,
+    SigBit &z_out_sig,
+    SigBit &z5_out_sig
+) {
+    // --- 准备工作 (已修复) ---
+    // 辅助函数：检查一个LUT是否包含某个输入信号
+    auto lut_has_input = [](const LutInfo &lut, const SigBit &input_sig) {
+        for (const auto &pair : lut.ordered_inputs) {
+            if (pair.second == input_sig) return true;
+        }
+        return false;
+    };
 
-	map<SigBit, int> new_input_map;
-	for (size_t i = 0; i < new_inputs.size(); ++i) {
-		new_input_map[new_inputs[i]] = i;
-	}
+    // 正确的逻辑：不包含sel_bit的LUT用于Z5 (sel=0)，包含sel_bit的用于Z (sel=1)
+    const LutInfo &lut_for_z5 = lut_has_input(lut_a, sel_bit) ? lut_b : lut_a;
+    const LutInfo &lut_for_z_sel1 = lut_has_input(lut_a, sel_bit) ? lut_a : lut_b;
 
-	// 创建非const拷贝以访问 .bits()
-	LutInfo lut_for_z5_copy = lut_for_z5;
-	LutInfo lut_for_z_sel1_copy = lut_for_z_sel1;
+    z5_out_sig = lut_for_z5.output;
+    z_out_sig = lut_for_z_sel1.output;
 
-	vector<SigBit> shared_inputs;
-	int sel_idx = -1;
-	for (size_t i = 0; i < new_inputs.size(); ++i) {
-		if (new_inputs[i] == sel_bit) {
-			sel_idx = i;
-		} else {
-			shared_inputs.push_back(new_inputs[i]);
-		}
-	}
-	// 为了使能6输入，选择信号必须存在
-	log_assert(sel_idx != -1);
-	while (shared_inputs.size() < 5)
-		shared_inputs.push_back(RTLIL::Sx); // 补齐到5个共享输入
+    vector<SigBit> shared_inputs;
+    for(size_t i = 0; i < 5; ++i) shared_inputs.push_back(new_inputs_vec[i]);
 
-	RTLIL::Const z_lut_init(RTLIL::S0, 32);
-	RTLIL::Const z5_lut_init(RTLIL::S0, 32);
+    RTLIL::Const init_a_copy = lut_for_z5.init_val;
+    RTLIL::Const init_b_copy = lut_for_z_sel1.init_val;
 
-	// 计算 Z5 (luta) 的 32-bit INIT
-	for (int i = 0; i < 32; ++i) {
-		unsigned int addr_a = 0;
-		int bit_pos = 1;
-		for (const auto &pair : lut_for_z5_copy.ordered_inputs) {
-			auto it = find(shared_inputs.begin(), shared_inputs.end(), pair.second);
-			if (it != shared_inputs.end()) {
-				int shared_idx = distance(shared_inputs.begin(), it);
-				if ((i >> shared_idx) & 1) {
-					addr_a += bit_pos;
-				}
-			}
-			bit_pos <<= 1;
-		}
-		if (lut_for_z5_copy.init_val.bits().at(addr_a) == RTLIL::S1) {
-			z5_lut_init.bits().at(i) = RTLIL::S1;
-		}
-	}
+    vector<RTLIL::State> z5_bits, z_bits;
+    z5_bits.reserve(32);
+    z_bits.reserve(32);
 
-	// 计算 Z 在 sel=1 时的 32-bit INIT (lutb)
-	for (int i = 0; i < 32; ++i) {
-		unsigned int addr_b = 0;
-		int bit_pos = 1;
-		for (const auto &pair : lut_for_z_sel1_copy.ordered_inputs) {
-			auto it = find(shared_inputs.begin(), shared_inputs.end(), pair.second);
-			if (it != shared_inputs.end()) {
-				int shared_idx = distance(shared_inputs.begin(), it);
-				if ((i >> shared_idx) & 1) {
-					addr_b += bit_pos;
-				}
-			}
-			bit_pos <<= 1;
-		}
-		if (lut_for_z_sel1_copy.init_val.bits().at(addr_b) == RTLIL::S1) {
-			z_lut_init.bits().at(i) = RTLIL::S1;
-		}
-	}
+    // 1. 计算 Z5 (sel=0) 的 32-bit 真值表
+    for (int i = 0; i < 32; ++i) {
+        size_t addr_a = 0;
+        int bit_pos = 1;
+        for (const auto &pair : lut_for_z5.ordered_inputs) {
+            auto it = find(shared_inputs.begin(), shared_inputs.end(), pair.second);
+            if (it != shared_inputs.end()) {
+                int shared_idx = distance(shared_inputs.begin(), it);
+                if ((i >> shared_idx) & 1) addr_a += bit_pos;
+            }
+            // 当计算Z5的逻辑时，sel_bit的值被认为是0，所以不需要做任何事
+            bit_pos <<= 1;
+        }
+        
+        if (addr_a < (size_t)GetSize(init_a_copy)) {
+            z5_bits.push_back(init_a_copy.bits().at(addr_a));
+        } else {
+            z5_bits.push_back(RTLIL::S0); 
+        }
+    }
 
-	// 将两个32-bit INIT合并成一个64-bit的GTP_LUT6D INIT
-	// 格式: {INIT_Z (高32位), INIT_Z5 (低32位)}
-	vector<RTLIL::State> final_init_bits = z5_lut_init.bits();
-	final_init_bits.insert(final_init_bits.end(), z_lut_init.bits().begin(), z_lut_init.bits().end());
+    // 2. 计算 Z (sel=1) 的 32-bit 真值表
+    for (int i = 0; i < 32; ++i) {
+        size_t addr_b = 0;
+        int bit_pos = 1;
+        for (const auto &pair : lut_for_z_sel1.ordered_inputs) {
+            auto it = find(shared_inputs.begin(), shared_inputs.end(), pair.second);
+            if (it != shared_inputs.end()) {
+                int shared_idx = distance(shared_inputs.begin(), it);
+                if ((i >> shared_idx) & 1) addr_b += bit_pos;
+            } else if (pair.second == sel_bit) {
+                // 当计算Z的逻辑时，sel_bit的值被认为是1
+                addr_b += bit_pos;
+            }
+            bit_pos <<= 1;
+        }
+        
+        if (addr_b < (size_t)GetSize(init_b_copy)) {
+            z_bits.push_back(init_b_copy.bits().at(addr_b));
+        } else {
+            z_bits.push_back(RTLIL::S0);
+        }
+    }
 
-	return RTLIL::Const(final_init_bits);
+    // --- 写入阶段 ---
+    vector<RTLIL::State> final_init_bits = z5_bits;
+    final_init_bits.insert(final_init_bits.end(), z_bits.begin(), z_bits.end());
+    
+    return RTLIL::Const(final_init_bits);
 }
 
 // =================================================================
@@ -274,11 +279,15 @@ void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandid
 			for (const auto &pair : lut_b.ordered_inputs)
 				current_union_inputs.insert(pair.second);
 
-			if (current_union_inputs.size() <= 6) {
-				// 计算分数：共享输入数 * 100 - 总输入数
-				int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
-				int score = shared_inputs * 100 - current_union_inputs.size();
-				candidates.push({(int)i, (int)j, score, current_union_inputs});
+			int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
+
+			if (current_union_inputs.size() <= 6 && shared_inputs <= 5) {
+				if (current_union_inputs.size() <= 6) {
+					// 计算分数：共享输入数 * 100 - 总输入数
+					int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
+					int score = shared_inputs * 100 - current_union_inputs.size();
+					candidates.push({(int)i, (int)j, score, current_union_inputs});
+				}
 			}
 		}
 	}
@@ -287,106 +296,135 @@ void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandid
 // =================================================================
 // 步骤 3: 执行合并操作
 // =================================================================
-void PerformMerges(Module *module, vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
+// 用于存储合并计划的安全结构体，不包含任何实时指针
+struct MergePlan {
+    RTLIL::IdString new_cell_name;
+    RTLIL::Const init_val;
+    map<RTLIL::IdString, RTLIL::SigBit> port_connections;
+    RTLIL::IdString cell_a_to_remove; // 只存储名字
+    RTLIL::IdString cell_b_to_remove; // 只存储名字
+};
+// 新版本：此函数只负责规划，返回一个安全的计划列表
+vector<MergePlan> PlanMerges(Module *module, vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
 {
-	int merges_done = 0;
-	while (!candidates.empty()) {
-		MergeCandidate best_pair = candidates.top();
-		candidates.pop();
+    vector<MergePlan> plans;
 
-		LutInfo &lut_a = luts[best_pair.idx_a];
-		LutInfo &lut_b = luts[best_pair.idx_b];
+    while (!candidates.empty()) {
+        MergeCandidate best_pair = candidates.top();
+        candidates.pop();
 
-		if (lut_a.is_merged || lut_b.is_merged) {
-			continue;
-		}
+        LutInfo &lut_a = luts[best_pair.idx_a];
+        LutInfo &lut_b = luts[best_pair.idx_b];
 
-		lut_a.is_merged = true;
-		lut_b.is_merged = true;
-		merges_done++;
+        if (lut_a.is_merged || lut_b.is_merged) continue;
 
-		vector<SigBit> new_inputs_vec;
-		for (const auto &sig : best_pair.union_inputs)
-			new_inputs_vec.push_back(sig);
-		while (new_inputs_vec.size() < 6)
-			new_inputs_vec.push_back(RTLIL::Sx);
+        lut_a.is_merged = true;
+        lut_b.is_merged = true;
 
-		// 智能地选择选择信号 (sel_bit)
-		// 找出只存在于一个LUT输入中的信号，它们是最佳选择信号
-		pool<SigBit> inputs_a, inputs_b;
-		for (const auto &p : lut_a.ordered_inputs)
-			inputs_a.insert(p.second);
-		for (const auto &p : lut_b.ordered_inputs)
-			inputs_b.insert(p.second);
+        // --- 核心计算逻辑 (保持不变) ---
+        vector<SigBit> new_inputs_vec;
+        for (const auto &sig : best_pair.union_inputs) new_inputs_vec.push_back(sig);
+        while (new_inputs_vec.size() < 6) new_inputs_vec.push_back(RTLIL::S0);
 
-		SigBit sel_bit = RTLIL::Sx;
-		for (const auto &sig : new_inputs_vec) {
-			if (sig != RTLIL::Sx && (inputs_a.count(sig) != inputs_b.count(sig))) {
-				sel_bit = sig;
-				break;
-			}
-		}
-		if (sel_bit == RTLIL::Sx)
-			sel_bit = new_inputs_vec[0]; // 兜底
+        pool<SigBit> inputs_a, inputs_b;
+        for (const auto &p : lut_a.ordered_inputs) inputs_a.insert(p.second);
+        for (const auto &p : lut_b.ordered_inputs) inputs_b.insert(p.second);
 
-		// 重新排列 new_inputs_vec, 将 sel_bit 放在最后 (I5)
-		auto sel_it = find(new_inputs_vec.begin(), new_inputs_vec.end(), sel_bit);
-		iter_swap(sel_it, new_inputs_vec.end() - 1);
+        SigBit sel_bit = RTLIL::Sx;
+        for (const auto &sig : new_inputs_vec) {
+            if (sig != RTLIL::S0 && (inputs_a.count(sig) != inputs_b.count(sig))) {
+                sel_bit = sig;
+                break;
+            }
+        }
+        if (sel_bit == RTLIL::Sx) {
+            for (const auto &sig : new_inputs_vec) {
+                if (sig != RTLIL::S0) {
+                    sel_bit = sig;
+                    break;
+                }
+            }
+        }
+        auto sel_it = find(new_inputs_vec.begin(), new_inputs_vec.end(), sel_bit);
+        if (sel_it != new_inputs_vec.end()) iter_swap(sel_it, new_inputs_vec.end() - 1);
 
-		SigBit z_out, z5_out;
-		RTLIL::Const new_init = calculate_new_init(lut_a, lut_b, new_inputs_vec, sel_bit, true, z_out, z5_out);
-
-		// --- 修复字符串拼接和IdString构造 ---
-		// 1. 构造一个合法的Verilog风格的std::string
-		string new_name_str = string(log_id(lut_a.cell_ptr->name)) + "_" + string(log_id(lut_b.cell_ptr->name)) + "_merged";
-
-		// 2. 为它加上Yosys需要的'\'前缀来创建IdString
-		IdString new_cell_id = RTLIL::IdString("\\" + new_name_str);
-
-		Cell *new_lut = module->addCell(new_cell_id, ID(GTP_LUT6D));
+        SigBit z_out_target, z5_out_target;
+        RTLIL::Const new_init = calculate_new_init(lut_a, lut_b, new_inputs_vec, sel_bit, z_out_target, z5_out_target);
         
-		new_lut->setParam(ID::INIT, new_init);
-		for (size_t k = 0; k < 6; ++k) {
-			new_lut->setPort(IdString("\\I" + to_string(k)), new_inputs_vec[k]);
-		}
+        // --- 创建一个安全的计划 ---
+        MergePlan plan;
+        string new_name_str = string(log_id(lut_a.cell_ptr->name)) + "_" + string(log_id(lut_b.cell_ptr->name)) + "_merged";
+        plan.new_cell_name = module->uniquify(RTLIL::IdString("\\" + new_name_str));
+        plan.init_val = new_init;
 
-		// --- 修复端口ID ---
-		new_lut->setPort(ID(Z), z_out);
-		new_lut->setPort(ID(Z5), z5_out);
-
-		module->remove(lut_a.cell_ptr);
-		module->remove(lut_b.cell_ptr);
-	}
-	log("Performed %d merges.\n", merges_done);
+        for (size_t k = 0; k < 6; ++k) plan.port_connections[IdString("\\I" + to_string(k))] = new_inputs_vec[k];
+        plan.port_connections[ID(Z)] = z_out_target;
+        plan.port_connections[ID(Z5)] = z5_out_target;
+        
+        plan.cell_a_to_remove = lut_a.cell_ptr->name;
+        plan.cell_b_to_remove = lut_b.cell_ptr->name;
+        
+        plans.push_back(plan);
+    }
+    return plans;
 }
 
-// =================================================================
-// Main函数: 调用各步骤对应函数
-// =================================================================
+
+// 新版本：StitcherMain 负责调用规划和执行
 void StitcherMain(Module *module, const std::string &dump_filename)
 {
-	auto start_time = std::chrono::high_resolution_clock::now();
+    auto start_time = std::chrono::high_resolution_clock::now();
 
-	log("Step 1: Scanning and collecting all GTP_LUTs...\n");
-	SigMap sigmap(module);
-	vector<LutInfo> all_luts;
-	CollectLuts(module, sigmap, all_luts); 
+    log("Step 1: Scanning and collecting all GTP_LUTs...\n");
+    SigMap sigmap(module);
+    vector<LutInfo> all_luts;
+    CollectLuts(module, sigmap, all_luts);
 
-	if (!dump_filename.empty()) {
-		dump_luts_to_file(dump_filename, all_luts);
-	}
+    if (!dump_filename.empty()) {
+        dump_luts_to_file(dump_filename, all_luts);
+    }
 
-	log("Step 2: Finding best pairs to merge...\n");
-	priority_queue<MergeCandidate> candidates;
-	FindMergeCandidates(all_luts, candidates); 
-	log("Found %zu potential merge candidates.\n", candidates.size());
+    log("Step 2: Finding best pairs to merge...\n");
+    priority_queue<MergeCandidate> candidates;
+    FindMergeCandidates(all_luts, candidates);
+    log("Found %zu potential merge candidates.\n", candidates.size());
 
-	log("Step 3: Performing merges...\n");
-	PerformMerges(module, all_luts, candidates); 
+    // --- 阶段一: 规划 ---
+    vector<MergePlan> plans = PlanMerges(module, all_luts, candidates);
+    if(plans.empty()){
+        log("No valid merges found.\n");
+        return;
+    }
+    log("Planned %zu merges.\n", plans.size());
 
-	auto end_time = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double, std::milli> elapsed_ms = end_time - start_time;
-	log("Whole process took %.2f ms.\n", all_luts.size(), elapsed_ms.count());
+    // --- 阶段二: 执行 (安全的"先移除，后添加"策略) ---
+    pool<RTLIL::IdString> cell_names_to_remove;
+    for(const auto& plan : plans) {
+        cell_names_to_remove.insert(plan.cell_a_to_remove);
+        cell_names_to_remove.insert(plan.cell_b_to_remove);
+    }
+
+    // 1. 先通过名字安全地移除所有旧单元
+    for(auto cell_name : cell_names_to_remove) {
+        if (module->cell(cell_name)) {
+            module->remove(module->cell(cell_name));
+        }
+    }
+
+    // 2. 然后添加所有新的 LUT6D 单元
+    for (const auto &plan : plans) {
+        Cell *new_lut = module->addCell(plan.new_cell_name, ID(GTP_LUT6D));
+        new_lut->setParam(ID::INIT, plan.init_val);
+        for (const auto &conn : plan.port_connections) {
+            new_lut->setPort(conn.first, conn.second);
+        }
+    }
+    
+    log("Performed %zu merges successfully.\n", plans.size());
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed_ms = end_time - start_time;
+    log("Whole process took %.2f ms.\n", elapsed_ms.count());
 }
 
 struct StitcherPass : public Pass {
@@ -400,7 +438,6 @@ struct StitcherPass : public Pass {
 		log_header(design, "Executing StitcherPass (Basic Task).\n");
 		clear_flags();
 
-		// 1. 解析命令行参数
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-dump" && argidx + 1 < args.size()) {
@@ -411,12 +448,12 @@ struct StitcherPass : public Pass {
 		}
 		extra_args(args, argidx, design);
 
-		// 2. 获取模块
 		Module *module = design->top_module();
 		if (module == nullptr)
 			log_cmd_error("No top module found.\n");
 
-		// 3. 调用核心算法
+		// --- 关键修改：直接在顶层模块上执行，不再进行任何克隆或替换 ---
+		log("Performing in-place LUT stitching on module: %s\n", log_id(module));
 		StitcherMain(module, dump_filename);
 
 		log("Stitching complete.\n");
