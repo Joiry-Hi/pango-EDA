@@ -113,6 +113,7 @@ void print_lut_info_to_stream(ostream &f, const LutInfo &info)
 	f << "  - Cell: " << log_id(info.cell_ptr->name) << " (Type: " << log_id(info.cell_ptr->type) << ", Size: " << info.size << ")\n";
 	f << "    Output: " << log_signal(info.output) << "\n";
 
+	// --- 修改在这里 ---
 	// 遍历有序字典，打印出端口名和对应的信号
 	f << "    Inputs:\n";
 	for (const auto &pair : info.ordered_inputs) {
@@ -124,7 +125,6 @@ void print_lut_info_to_stream(ostream &f, const LutInfo &info)
 	f << "    INIT: " << GetSize(info.init_val) << "'b" << info.init_val.as_string() << "\n\n";
 }
 
-//将每个 LUT 的详细信息写入文件
 void dump_luts_to_file(const string &filename, const vector<LutInfo> &luts)
 {
 	ofstream f(filename);
@@ -230,33 +230,26 @@ RTLIL::Const calculate_new_init(const LutInfo &lut_a, const LutInfo &lut_b, cons
 }
 
 // =================================================================
-// 步骤 1: 提取所有单输出GTP_LUT的信息
-//LUT的输入信号
-//LUT的输出信号
-//LUT的大小
-//LUT的内存地址
-//LUT的INIT
+// 步骤 1: 提取所有GTP_LUT的信息
 // =================================================================
 void CollectLuts(Module *module, SigMap &sigmap, vector<LutInfo> &luts)
 {
-	//防止旧数据干扰
 	luts.clear();
-	//遍历
 	for (Cell *cell : module->cells()) {
-		//筛选出LUT
 		const char *type_str = cell->type.c_str();
 		if (strncmp(type_str, "\\GTP_LUT", 8) == 0 && strlen(type_str) == 9) {
 			LutInfo info;
-			info.cell_ptr = cell;				//保存指针操作数据
-			info.size = type_str[8] - '0';		//LUT大小
-			
-			//如果某个端口没有连接信号线
-			//TODO
+			info.cell_ptr = cell;
+			info.size = type_str[8] - '0';
+
+			// ---  修改在这里 ---
+			// 按照端口名 I0, I1, ... 顺序提取输入
 			for (int i = 0; i < info.size; ++i) {
 				string port_name = "I" + to_string(i);
-				IdString port_id = IdString("\\" + port_name); 
+				IdString port_id = IdString("\\" + port_name); // Yosys内部端口名通常带'\'
 
 				if (cell->hasPort(port_id)) {
+					// 将 (端口名, 信号) 存入有序字典
 					info.ordered_inputs[port_name] = sigmap(cell->getPort(port_id));
 				}
 			}
@@ -282,10 +275,8 @@ struct MergeCandidate {
 	}
 };
 
-//寻找可以合并的LUT/存储在candidates里面
 void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
 {
-	//遍历LUT
 	for (size_t i = 0; i < luts.size(); ++i) {
 		for (size_t j = i + 1; j < luts.size(); ++j) {
 			const LutInfo &lut_a = luts[i];
@@ -300,12 +291,13 @@ void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandid
 
 			int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
 
-			//两种情况
-			//第一种	输入总和小于等于5
-			if (current_union_inputs.size() <= 5) {
-				int score = shared_inputs * 100 - current_union_inputs.size();
-				candidates.push({(int)i, (int)j, score, current_union_inputs});
-			}
+			if (current_union_inputs.size() <= 6 && shared_inputs <= 5) {
+				if (current_union_inputs.size() <= 6) {
+					// 计算分数：共享输入数 * 100 - 总输入数
+					int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
+					int score = shared_inputs * 100 - current_union_inputs.size();
+					candidates.push({(int)i, (int)j, score, current_union_inputs});
+				}
 
 			//TODO	
 			//第二种	输入等于6
@@ -350,34 +342,62 @@ vector<MergePlan> PlanMerges(Module *module, vector<LutInfo> &luts, priority_que
 
 		//将之前存储的输入和作为新的输入
 		vector<SigBit> new_inputs_vec;
+		SigBit sel_bit;
+		
+		// --- 【新改良逻辑分支】 ---
+		if (best_pair.union_inputs.size() <= 5) {
+			// --- 情况一：总输入数 <= 5，sel_bit 直接接地 ---
+			
+			// 1. 填充输入向量
+			for (const auto &sig : best_pair.union_inputs)
+				new_inputs_vec.push_back(sig);
+			
+			// 2. 补位到5个输入（如果需要）
+			while (new_inputs_vec.size() < 5)
+				new_inputs_vec.push_back(RTLIL::S0);
 
-		//TODO	将LUTa输入顺序填写	再将LUTb特有的部分顺序填写
-		new_inputs_vec.push_back();
+			// 3. 强制 sel_bit 为常数 '0'，并作为第6个输入
+			sel_bit = RTLIL::S1;
+			new_inputs_vec.push_back(sel_bit); // 现在 new_inputs_vec 有6个元素
 
-		//若输入小于5,补齐
-		while (new_inputs_vec.size() < 6)
-			new_inputs_vec.push_back(RTLIL::S0);
-		//第6个输入sel固定为常数0
-		new_inputs_vec.push_back(RTLIL::S0);
+		} else {
+			// --- 情况二：总输入数 == 6，使用智能选择逻辑 ---
 
-		//保存ab的输入
-		pool<SigBit> inputs_a, inputs_b;
-		for (const auto &p : lut_a.ordered_inputs)
-			inputs_a.insert(p.second);
-		for (const auto &p : lut_b.ordered_inputs)
-			inputs_b.insert(p.second);
+			// 1. 填充6个输入
+			for (const auto &sig : best_pair.union_inputs)
+				new_inputs_vec.push_back(sig);
 
-		//TODO，新输入的最后一个就是sel，没必要单独传，不需要调整位置
-		// auto sel_it = find(new_inputs_vec.begin(), new_inputs_vec.end(), sel_bit);
-		// if (sel_it != new_inputs_vec.end())
-		// 	iter_swap(sel_it, new_inputs_vec.end() - 1);
+			// 2. 智能选择 sel_bit
+			pool<SigBit> inputs_a, inputs_b;
+			for (const auto &p : lut_a.ordered_inputs)
+				inputs_a.insert(p.second);
+			for (const auto &p : lut_b.ordered_inputs)
+				inputs_b.insert(p.second);
 
-		//TODO，之前没有保存两个LUT的输出马
-		// SigBit z_out_target, z5_out_target;
-		SigBit z_out_target = lut_b.output;
-		SigBit z5_out_target = lut_a.output;
+			sel_bit = RTLIL::Sx;
+			for (const auto &sig : new_inputs_vec) {
+				if (sig != RTLIL::S0 && (inputs_a.count(sig) != inputs_b.count(sig))) {
+					sel_bit = sig;
+					break;
+				}
+			}
+			if (sel_bit == RTLIL::Sx) {
+				for (const auto &sig : new_inputs_vec) {
+					if (sig != RTLIL::S0) {
+						sel_bit = sig;
+						break;
+					}
+				}
+			}
 
-		//TODO sel 没有必要记录
+			// 3. 将选出的 sel_bit 映射到 I5 端口
+			auto sel_it = find(new_inputs_vec.begin(), new_inputs_vec.end(), sel_bit);
+			if (sel_it != new_inputs_vec.end())
+				iter_swap(sel_it, new_inputs_vec.end() - 1);
+		}
+
+		// --- 公共逻辑：计算 INIT 并创建规划 ---
+		SigBit z_out_target, z5_out_target;
 		RTLIL::Const new_init = calculate_new_init(lut_a, lut_b, new_inputs_vec, sel_bit, z_out_target, z5_out_target);
 
 		//创建一个结构体，保存合并LUT所需要的全部信息
@@ -419,7 +439,7 @@ void StitcherMain(Module *module, const std::string &dump_filename)
     // 遍历模块所有连接：扫描 module->connections() 中存储的所有信号连接关系（导线之间的连接、端口与内部信号的连接）
 	CollectLuts(module, sigmap, all_luts);
 
-	//TODO 什么file
+	//TODO 什么file(LUT结构体数组打印)
 	if (!dump_filename.empty()) {
 		dump_luts_to_file(dump_filename, all_luts);
 	}
@@ -482,6 +502,7 @@ struct StitcherPass : public Pass {
 		log_header(design, "Executing StitcherPass (Basic Task).\n");
 		clear_flags();
 
+		// 可添加-dump参数来把LUT结构体数组打印成一个文件
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-dump" && argidx + 1 < args.size()) {
