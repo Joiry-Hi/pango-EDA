@@ -1,6 +1,6 @@
 # ---------------------------------------------
 # synthesis using synth_pango.cc 
-read_verilog -icells design_201.v
+read_verilog -icells design.v
 hierarchy  -top design_201
 flatten
 design -save before_map
@@ -37,5 +37,82 @@ equiv_simple
 #equiv_induct equiv
 equiv_status -assert equiv  
 
-#score -before design_201.v -after demo_after_syn.v
+    
+# run_stitcher_verify.ys
+# A complete optimization and verification script for the StitcherPass (Basic Task).
+
+# =========================================================================
+# Stage 1: Load the initial mapped netlist (the input for our stitcher)
+# =========================================================================
+
+# 读入一个已经映射好的、只包含GTP_LUT的网表
+# 这通常是官方mapper或者Yosys通用mapper的输出
+read_verilog -icells demo_after_syn_201.v
+
+hierarchy -top design_201
+flatten
+
+# 【关键步骤 1】
+# 在运行你的stitcher之前，将当前的设计保存为一个快照。
+# 这个快照是“黄金参考”(gold)，包含了优化前的GTP_LUT电路。
+design -save before_stitch
+
+# =========================================================================
+# Stage 2: Run your stitching algorithm
+# =========================================================================
+
+# 调用你为基础题写的新命令
+stitcher -dump lut_info_dump.txt
+
+# (可选) 检查一下，确保没有不应该出现的单元
+check
+
+# 将你stitcher处理后的结果写入文件，方便查看
+write_verilog -noattr -noexpr design_201_stitched.v
+
+# =========================================================================
+# Stage 3: Formal Equivalence Checking
+# =========================================================================
+
+# -------- 准备 'gate' 电路 (你的stitcher的输出) -------
+# 'gate'电路当前就在内存中。我们需要读入仿真库来让Yosys理解GTP原语的行为。
+read_verilog -icells +/pango/pango_sim.v
+hierarchy -top design_201
+flatten 
+design -stash after_stitch
+
+
+# -------- 准备 'gold' 电路 (原始的GTP_LUT电路) -------
+# 【关键步骤 2】
+# 从内存中调出我们之前保存的“黄金参考”快照。
+design -load before_stitch
+
+# 同样地，为它也读入仿真库。
+read_verilog -icells +/pango/pango_sim.v
+hierarchy -top design_201
+flatten 
+design -stash before_stitch
+
+
+# --------------- 开始建立对比电路 ----------------
+# 复制'gold'和'gate'版本，为equiv_make做准备
+design -copy-from before_stitch -as gold A:top
+design -copy-from after_stitch -as gate A:top
+
+# 读入库文件，这是最佳实践
+read_verilog -lib -nooverwrite +/pango/pango_lib.v
+
+# 创建对比电路，连接输入，并在输出端插入比较器
+equiv_make -inames gold gate equiv
+
+# 运行一个简单的组合逻辑等价性检查算法
+equiv_simple
+
+# 【最终裁决】
+# 检查状态。-assert会确保在发现任何不一致时，脚本会立即报错并终止。
+equiv_status -assert equiv  
+
+log "SUCCESS: Equivalence check passed for stitcher!"
+
+score -before demo_after_syn_201.v -after design_201_stitched.v
 
