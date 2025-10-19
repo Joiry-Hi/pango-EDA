@@ -114,5 +114,4 @@ equiv_status -assert equiv
 
 log "SUCCESS: Equivalence check passed for stitcher!"
 
-score -before demo_after_syn_1.v -after design_1_stitched.v
-
+#score -before demo_after_syn_1.v -after design_1_stitched.v

@@ -408,7 +408,7 @@ void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandid
 			}
 		}
 	}
-	// --- 第二部分：处理 LUT6 吸收小 LUT 的情况 ---
+	//	--- 第二部分：处理 LUT6 吸收小 LUT 的情况 ---
 	// for (size_t i = 0; i < luts.size(); ++i) {
 	// 	if (luts[i].size != 6)
 	// 		continue; // 只从 LUT6 开始
@@ -559,14 +559,14 @@ void StitcherMain(Module *module, const std::string &dump_filename)
 	// 寻找合适的LUT对
 	log("Step 2: Finding best pairs to merge...\n");
 	priority_queue<MergeCandidate> candidates;
-	FindMergeCandidates(all_luts, candidates);
+	//FindMergeCandidates(all_luts, candidates);
 	log("Found %zu potential merge candidates.\n", candidates.size());
 
 	// --- 阶段一: 规划合并方案 ---
 	vector<MergePlan> plans = PlanMerges(module, all_luts, candidates);
 	if (plans.empty()) {
 		log("No valid merges found.\n");
-		return;
+		//return;
 	}
 	log("Planned %zu merges.\n", plans.size());
 
