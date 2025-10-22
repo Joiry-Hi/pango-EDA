@@ -12,7 +12,7 @@
 #include <string.h>
 #include <vector>
 
-#define Layered //控制是否启用分层优化
+//#define Layered //控制是否启用分层优化
 
 USING_YOSYS_NAMESPACE
 using namespace std;
@@ -448,6 +448,7 @@ struct MergeCandidate {
 	pool<SigBit> union_inputs;
 
 	MergeType type;
+	SigBit discovered_sel_bit; // 仅在 LUT6_ABSORB 类型下有效
 
 	bool operator<(const MergeCandidate &other) const { return score < other.score; }
 };
@@ -723,7 +724,7 @@ void StitcherMain(Module *module, const std::string &dump_filename)
 	}
 
 	// --- 新增步骤：计算深度并分区 ---
-	NumberLutsByLevel(module, all_luts);
+	NumberLutsByLevel(all_luts);
 
 	level_to_lut_indices.clear();
 	int max_level = 0;
