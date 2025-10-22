@@ -12,6 +12,8 @@
 #include <string.h>
 #include <vector>
 
+#define Layered //控制是否启用分层优化
+
 USING_YOSYS_NAMESPACE
 using namespace std;
 PRIVATE_NAMESPACE_BEGIN
@@ -27,16 +29,91 @@ struct LutInfo {
 	bool is_merged = false;
 };
 
-// //用于存储每个LUT的拓扑排序信息
-// struct TopoInfo {
-// 	int topo_id = -1;		       // 拓扑排序后的唯一编号
-// 	int level = -1;			       // 在拓扑结构中的层级/深度
-// 	vector<SigBit> ordered_unified_inputs; // 【关键】用于对比的、统一排序的输入信号
-// };
+// 用于按层次存储LUT索引的地图
+map<int, vector<int>> level_to_lut_indices;
 
-// // 用于方便地通过Cell指针或SigBit查找信息
-// dict<RTLIL::Cell *, TopoInfo> cell_to_topo_info;
-// dict<RTLIL::SigBit, int> output_sig_to_topo_id; // 输出信号跟随其驱动LUT的编号
+// =================================================================
+// 新增：根据拓扑深度对LUT进行分层
+// =================================================================
+
+// 用于存储每个LUT的深度/层次信息
+dict<RTLIL::Cell *, int> lut_levels;
+
+// 分层函数
+void NumberLutsByLevel(const vector<LutInfo> &luts)
+{
+	log("Numbering LUTs by topological level...\n");
+	lut_levels.clear();
+
+	// --- 准备工作：建立图的邻接关系和入度表 ---
+	dict<RTLIL::Cell *, pool<RTLIL::Cell *>> lut_graph; // LUT -> set of downstream LUTs
+	dict<RTLIL::Cell *, int> lut_in_degree;
+	dict<RTLIL::SigBit, RTLIL::Cell *> output_sig_to_lut; // 方便快速查找驱动LUT
+
+	// 快速查找一个Cell指针是否在我们的LUT列表中
+	pool<RTLIL::Cell *> lut_cell_pool;
+	for (const auto &lut : luts) {
+		lut_cell_pool.insert(lut.cell_ptr);
+		output_sig_to_lut[lut.output] = lut.cell_ptr;
+
+		lut_graph[lut.cell_ptr] = {}; 
+	}
+
+	for (const auto &src_lut : luts) {
+		lut_in_degree[src_lut.cell_ptr] = 0; // 初始化入度
+
+		// 计算当前LUT的入度 (只考虑来自其他LUT的输入)
+		for (const auto &pair : src_lut.ordered_inputs) {
+			SigBit input_sig = pair.second;
+			// 检查这个输入是否由另一个LUT驱动
+			if (output_sig_to_lut.count(input_sig)) {
+				RTLIL::Cell *driver_lut_ptr = output_sig_to_lut.at(input_sig);
+
+				// 建立从驱动LUT到当前LUT的边
+				if (lut_graph[driver_lut_ptr].insert(src_lut.cell_ptr).second) {
+					// 只有在第一次添加边时才增加入度
+					lut_in_degree[src_lut.cell_ptr]++;
+				}
+			}
+		}
+	}
+
+	// --- 拓扑排序计算深度 (Kahn's Algorithm using BFS) ---
+	queue<RTLIL::Cell *> q;
+	for (const auto &lut : luts) {
+		if (lut_in_degree[lut.cell_ptr] == 0) {
+			q.push(lut.cell_ptr);
+			lut_levels[lut.cell_ptr] = 0; // 起始LUT的深度为0
+		}
+	}
+
+	int processed_count = 0;
+	while (!q.empty()) {
+		RTLIL::Cell *current_lut_ptr = q.front();
+		q.pop();
+		processed_count++;
+
+		int current_level = lut_levels.at(current_lut_ptr);
+
+		for (RTLIL::Cell *downstream_lut_ptr : lut_graph.at(current_lut_ptr)) {
+			// 更新下游节点的深度为 max(current_depth, my_depth + 1)
+			int new_level = current_level + 1;
+			if (!lut_levels.count(downstream_lut_ptr) || new_level > lut_levels.at(downstream_lut_ptr)) {
+				lut_levels[downstream_lut_ptr] = new_level;
+			}
+
+			// 更新入度
+			if (--lut_in_degree.at(downstream_lut_ptr) == 0) {
+				q.push(downstream_lut_ptr);
+			}
+		}
+	}
+
+	if (processed_count != (int)luts.size()) {
+		log_warning("Combinational loop detected among LUTs. Leveling may be incomplete.\n");
+		// 对于循环中的节点，它们不会被处理，level将不存在
+	}
+}
 
 #pragma region print_funcs
 // =================================================================
@@ -137,9 +214,6 @@ void dump_luts_to_file(const string &filename, const vector<LutInfo> &luts)
 }
 #pragma endregion print_funcs
 
-// =================================================================
-// 最终、最可靠的 INIT 计算函数 (已修复逻辑漏洞)
-// =================================================================
 RTLIL::Const calculate_new_init(const LutInfo &lut_a, const LutInfo &lut_b, const vector<SigBit> &new_inputs_vec, const SigBit &sel_bit,
 				SigBit &z_out_sig, SigBit &z5_out_sig)
 {
@@ -332,7 +406,6 @@ bool CanLut6AbsorbLutS(const LutInfo &lut_6, const LutInfo &lut_s, SigBit &found
 // =================================================================
 // 步骤 1: 提取所有GTP_LUT的信息
 // =================================================================
-// TODO:增加读入时对所有LUT进行分层的功能
 void CollectLuts(Module *module, SigMap &sigmap, vector<LutInfo> &luts)
 {
 	luts.clear();
@@ -375,12 +448,103 @@ struct MergeCandidate {
 	pool<SigBit> union_inputs;
 
 	MergeType type;
-	SigBit discovered_sel_bit; // 仅在 LUT6_ABSORB 类型下有效
 
 	bool operator<(const MergeCandidate &other) const { return score < other.score; }
 };
 
-// TODO：需添加分层搜索逻辑
+// 已添加分层逻辑
+#ifdef Layered
+void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
+{
+	// --- 辅助Lambda 1: 检查 SHARED_INPUTS 类型的合并 ---
+	auto check_shared_inputs = [&](int i, int j) {
+		const LutInfo &lut_a = luts[i];
+		const LutInfo &lut_b = luts[j];
+
+		pool<SigBit> current_union_inputs;
+		for (const auto &pair : lut_a.ordered_inputs)
+			current_union_inputs.insert(pair.second);
+		for (const auto &pair : lut_b.ordered_inputs)
+			current_union_inputs.insert(pair.second);
+
+		if (current_union_inputs.size() <= 5) {
+			int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
+			if (shared_inputs >= 1) {
+				int score = shared_inputs * 100 - current_union_inputs.size();
+				candidates.push({i, j, score, current_union_inputs, MergeType::SHARED_INPUTS, RTLIL::Sx});
+			}
+		}
+	};
+
+	// --- 辅助Lambda 2: 检查 LUT6_ABSORB 类型的合并 ---
+	auto check_lut6_absorb = [&](int idx_6, int idx_s) {
+		const LutInfo &lut_6 = luts[idx_6];
+		const LutInfo &lut_s = luts[idx_s];
+
+		// 1. 快速检查：尺寸必须是6和一个更小的
+		if (lut_6.size != 6 || lut_s.size >= 6)
+			return;
+
+		// 2. 检查输入子集关系
+		pool<SigBit> inputs_6, inputs_s;
+		for (const auto &p : lut_6.ordered_inputs)
+			inputs_6.insert(p.second);
+		for (const auto &p : lut_s.ordered_inputs)
+			inputs_s.insert(p.second);
+
+		bool is_subset = true;
+		for (const auto &sig_s : inputs_s) {
+			if (!inputs_6.count(sig_s)) {
+				is_subset = false;
+				break;
+			}
+		}
+		if (!is_subset)
+			return;
+
+		// 3. 检查逻辑关系
+		SigBit sel_bit;
+		if (CanLut6AbsorbLutS(lut_6, lut_s, sel_bit)) {
+			int score = 10000 + lut_s.size * 100;
+			candidates.push({idx_6, idx_s, score, inputs_6, MergeType::LUT6_ABSORB, sel_bit});
+		}
+	};
+
+	// --- 核心：分层搜索 ---
+	for (const auto &pair : level_to_lut_indices) {
+		int level = pair.first;
+		const vector<int> &luts_in_current_level = pair.second;
+
+		// --- 1. 在当前层内部进行搜索 ---
+		for (size_t i = 0; i < luts_in_current_level.size(); ++i) {
+			for (size_t j = i + 1; j < luts_in_current_level.size(); ++j) {
+				int lut_idx_a = luts_in_current_level[i];
+				int lut_idx_b = luts_in_current_level[j];
+
+				// 检查两种合并可能性
+				check_shared_inputs(lut_idx_a, lut_idx_b);
+				check_lut6_absorb(lut_idx_a, lut_idx_b); // 检查 a 是否能吸收 b
+				check_lut6_absorb(lut_idx_b, lut_idx_a); // 检查 b 是否能吸收 a
+			}
+		}
+
+		// --- 2. 与下一相邻层之间进行搜索 ---
+		if (level_to_lut_indices.count(level + 1)) {
+			const vector<int> &luts_in_next_level = level_to_lut_indices.at(level + 1);
+			for (int lut_idx_curr : luts_in_current_level) {
+				for (int lut_idx_next : luts_in_next_level) {
+					// 检查两种合并可能性
+					check_shared_inputs(lut_idx_curr, lut_idx_next);
+					check_lut6_absorb(lut_idx_curr, lut_idx_next); // 检查 curr 是否能吸收 next
+					check_lut6_absorb(lut_idx_next, lut_idx_curr); // 检查 next 是否能吸收 curr
+				}
+			}
+		}
+	}
+}
+#endif
+
+#ifndef Layered
 void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
 {
 	//  --- 第一部分：处理总输入 <= 5 的情况 (代码保持不变) ---
@@ -409,44 +573,45 @@ void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandid
 		}
 	}
 	//	--- 第二部分：处理 LUT6 吸收小 LUT 的情况 ---
-	// for (size_t i = 0; i < luts.size(); ++i) {
-	// 	if (luts[i].size != 6)
-	// 		continue; // 只从 LUT6 开始
-	// 	const LutInfo &lut_6 = luts[i];
+	for (size_t i = 0; i < luts.size(); ++i) {
+		if (luts[i].size != 6)
+			continue; // 只从 LUT6 开始
+		const LutInfo &lut_6 = luts[i];
 
-	// 	for (size_t j = 0; j < luts.size(); ++j) {
-	// 		if (i == j)
-	// 			continue;
-	// 		const LutInfo &lut_s = luts[j];
+		for (size_t j = 0; j < luts.size(); ++j) {
+			if (i == j)
+				continue;
+			const LutInfo &lut_s = luts[j];
 
-	// 		// 1. 检查输入子集关系
-	// 		pool<SigBit> inputs_6, inputs_s;
-	// 		for (const auto &p : lut_6.ordered_inputs)
-	// 			inputs_6.insert(p.second);
-	// 		for (const auto &p : lut_s.ordered_inputs)
-	// 			inputs_s.insert(p.second);
+			// 1. 检查输入子集关系
+			pool<SigBit> inputs_6, inputs_s;
+			for (const auto &p : lut_6.ordered_inputs)
+				inputs_6.insert(p.second);
+			for (const auto &p : lut_s.ordered_inputs)
+				inputs_s.insert(p.second);
 
-	// 		bool is_subset = true;
-	// 		for (const auto &sig_s : inputs_s) {
-	// 			if (!inputs_6.count(sig_s)) {
-	// 				is_subset = false;
-	// 				break;
-	// 			}
-	// 		}
-	// 		if (!is_subset)
-	// 			continue;
+			bool is_subset = true;
+			for (const auto &sig_s : inputs_s) {
+				if (!inputs_6.count(sig_s)) {
+					is_subset = false;
+					break;
+				}
+			}
+			if (!is_subset)
+				continue;
 
-	// 		// 2. 检查逻辑关系 (调用新的辅助函数)
-	// 		SigBit sel_bit;
-	// 		if (CanLut6AbsorbLutS(lut_6, lut_s, sel_bit)) {
-	// 			// 这是一个完美的吸收机会！
-	// 			// 给予极高的分数，确保优先处理
-	// 			int score = 10000 + lut_s.size * 100;
-	// 			candidates.push({(int)i, (int)j, score, inputs_6, MergeType::LUT6_ABSORB, sel_bit});
-	// 		}
-	// 	}
-	// }
+			// 2. 检查逻辑关系 (调用新的辅助函数)
+			SigBit sel_bit;
+			if (CanLut6AbsorbLutS(lut_6, lut_s, sel_bit)) {
+				// 这是一个完美的吸收机会！
+				// 给予极高的分数，确保优先处理
+				int score = 10000 + lut_s.size * 100;
+				candidates.push({(int)i, (int)j, score, inputs_6, MergeType::LUT6_ABSORB, sel_bit});
+			}
+		}
+	}
 }
+#endif
 
 // =================================================================
 // 步骤 3: 执行合并操作
@@ -512,6 +677,7 @@ vector<MergePlan> PlanMerges(Module *module, vector<LutInfo> &luts, priority_que
 
 		// --- 公共逻辑：计算 INIT 并创建规划 ---
 		SigBit z_out_target, z5_out_target;
+
 		RTLIL::Const new_init = calculate_new_init(lut_a, lut_b, new_inputs_vec, sel_bit, z_out_target, z5_out_target);
 
 		// 创建一个结构体，保存合并LUT所需要的全部信息
@@ -556,17 +722,33 @@ void StitcherMain(Module *module, const std::string &dump_filename)
 		dump_luts_to_file(dump_filename, all_luts);
 	}
 
+	// --- 新增步骤：计算深度并分区 ---
+	NumberLutsByLevel(module, all_luts);
+
+	level_to_lut_indices.clear();
+	int max_level = 0;
+	for (size_t i = 0; i < all_luts.size(); ++i) {
+		RTLIL::Cell *cell_ptr = all_luts[i].cell_ptr;
+		if (lut_levels.count(cell_ptr)) {
+			int level = lut_levels.at(cell_ptr);
+			level_to_lut_indices[level].push_back(i);
+			if (level > max_level)
+				max_level = level;
+		}
+	}
+	log("Partitioned LUTs into %d levels (from 0 to %d).\n", level_to_lut_indices.size(), max_level);
+
 	// 寻找合适的LUT对
 	log("Step 2: Finding best pairs to merge...\n");
 	priority_queue<MergeCandidate> candidates;
-	//FindMergeCandidates(all_luts, candidates);
+	FindMergeCandidates(all_luts, candidates);
 	log("Found %zu potential merge candidates.\n", candidates.size());
 
 	// --- 阶段一: 规划合并方案 ---
 	vector<MergePlan> plans = PlanMerges(module, all_luts, candidates);
 	if (plans.empty()) {
 		log("No valid merges found.\n");
-		//return;
+		return;
 	}
 	log("Planned %zu merges.\n", plans.size());
 
