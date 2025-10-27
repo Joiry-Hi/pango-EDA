@@ -7,17 +7,24 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <omp.h>
 #include <queue>
 #include <ranges>
 #include <string.h>
 #include <vector>
-#include <omp.h>
 
 #define Layered // 控制是否启用分层优化
+#define USE_OPENMP // 控制是否开启并行优化
 
 USING_YOSYS_NAMESPACE
 using namespace std;
 PRIVATE_NAMESPACE_BEGIN
+
+// 定义动态选择策略的阈值
+// 如果LUT总数超过这个值，就启用分层优化
+const size_t LAYERED_SEARCH_THRESHOLD = 20000;
+
+const double SEARCH_TIMEOUT_SECONDS = 300.0; //控制单个搜索进程的超时退出阈值（虽然并行化后没啥必要了）
 
 // =================================================================
 // 计时辅助类
@@ -55,16 +62,8 @@ struct LutInfo {
 	bool is_merged = false;
 };
 
-// 定义动态选择策略的阈值
-// 如果LUT总数超过这个值，就启用分层优化
-const size_t LAYERED_SEARCH_THRESHOLD = 30000;
-
 // 用于按层次存储LUT索引的地图
 map<int, vector<int>> level_to_lut_indices;
-
-// =================================================================
-// 新增：根据拓扑深度对LUT进行分层
-// =================================================================
 
 // 用于存储每个LUT的深度/层次信息
 dict<RTLIL::Cell *, int> lut_levels;
@@ -483,95 +482,179 @@ struct MergeCandidate {
 	bool operator<(const MergeCandidate &other) const { return score < other.score; }
 };
 
-// 已添加分层逻辑
+// =================================================================
+// 新的、独立的辅助函数，用于检查一对LUT的所有合并可能性
+// =================================================================
+void check_and_add_candidates(
+    const vector<LutInfo>& luts, 
+    int idx_a, 
+    int idx_b, 
+    vector<MergeCandidate>& local_candidates
+)
+{
+    const LutInfo &lut_a = luts[idx_a];
+    const LutInfo &lut_b = luts[idx_b];
+
+    // --- 逻辑 1: 检查 SHARED_INPUTS 类型的合并 (来自旧的 check_shared_inputs) ---
+    pool<SigBit> current_union_inputs;
+    for (const auto &pair : lut_a.ordered_inputs)
+        current_union_inputs.insert(pair.second);
+    for (const auto &pair : lut_b.ordered_inputs)
+        current_union_inputs.insert(pair.second);
+
+    if (current_union_inputs.size() <= 5) {
+        int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
+        if (shared_inputs >= 1) {
+            int score = shared_inputs * 100 - current_union_inputs.size();
+            local_candidates.push_back({idx_a, idx_b, score, current_union_inputs, MergeType::SHARED_INPUTS, RTLIL::Sx});
+        }
+    }
+
+    // --- 逻辑 2: 检查 LUT6_ABSORB 类型的合并 (来自旧的 check_lut6_absorb) ---
+    
+    // 可能性 A: a 吸收 b
+    if (lut_a.size == 6 && lut_b.size < 6) {
+        pool<SigBit> inputs_a;
+		for (const auto &p : lut_a.ordered_inputs) inputs_a.insert(p.second);
+        
+        // 检查输入子集关系
+        bool is_subset = true;
+        for (const auto &p_b : lut_b.ordered_inputs) {
+            if (!inputs_a.count(p_b.second)) {
+                is_subset = false;
+                break;
+            }
+        }
+
+        if (is_subset) {
+            SigBit sel_bit;
+            if (CanLut6AbsorbLutS(lut_a, lut_b, sel_bit)) {
+                int score = 10000 + lut_b.size * 100;
+                local_candidates.push_back({idx_a, idx_b, score, inputs_a, MergeType::LUT6_ABSORB, sel_bit});
+            }
+        }
+    }
+
+    // 可能性 B: b 吸收 a
+    if (lut_b.size == 6 && lut_a.size < 6) {
+        pool<SigBit> inputs_b;
+		for (const auto &p : lut_b.ordered_inputs) inputs_b.insert(p.second);
+
+        // 检查输入子集关系
+        bool is_subset = true;
+        for (const auto &p_a : lut_a.ordered_inputs) {
+            if (!inputs_b.count(p_a.second)) {
+                is_subset = false;
+                break;
+            }
+        }
+        
+        if (is_subset) {
+            SigBit sel_bit;
+            if (CanLut6AbsorbLutS(lut_b, lut_a, sel_bit)) {
+                int score = 10000 + lut_a.size * 100;
+                local_candidates.push_back({idx_b, idx_a, score, inputs_b, MergeType::LUT6_ABSORB, sel_bit});
+            }
+        }
+    }
+}
+
+// 已添加多线程并行功能
 void FindMergeCandidates_Layered(const vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
 {
-	log("Using layered search strategy (LUT count > %zu).\n", LAYERED_SEARCH_THRESHOLD);
+#ifdef USE_OPENMP
+	log("Using layered search strategy (LUT count > %zu) with multi-threading.\n", LAYERED_SEARCH_THRESHOLD);
+#else
+	log("Using layered search strategy (LUT count > %zu) without multi-threading.\n", LAYERED_SEARCH_THRESHOLD);
+#endif
 
-	// --- 辅助Lambda 1: 检查 SHARED_INPUTS 类型的合并 ---
-	auto check_shared_inputs = [&](int i, int j) {
-		const LutInfo &lut_a = luts[i];
-		const LutInfo &lut_b = luts[j];
+	auto start_time = std::chrono::high_resolution_clock::now();
+	bool timed_out = false;
 
-		pool<SigBit> current_union_inputs;
-		for (const auto &pair : lut_a.ordered_inputs)
-			current_union_inputs.insert(pair.second);
-		for (const auto &pair : lut_b.ordered_inputs)
-			current_union_inputs.insert(pair.second);
+	int max_level = 0;
+	if (!level_to_lut_indices.empty()) {
+		max_level = level_to_lut_indices.rbegin()->first;
+	}
 
-		if (current_union_inputs.size() <= 5) {
-			int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
-			if (shared_inputs >= 1) {
-				int score = shared_inputs * 100 - current_union_inputs.size();
-				candidates.push({i, j, score, current_union_inputs, MergeType::SHARED_INPUTS, RTLIL::Sx});
-			}
-		}
-	};
+	// 串行地遍历每一个 level
+	for (int level = 0; level <= max_level; ++level) {
+		if (timed_out) break;
+		if (!level_to_lut_indices.count(level)) continue;
 
-	// --- 辅助Lambda 2: 检查 LUT6_ABSORB 类型的合并 ---
-	auto check_lut6_absorb = [&](int idx_6, int idx_s) {
-		const LutInfo &lut_6 = luts[idx_6];
-		const LutInfo &lut_s = luts[idx_s];
+		const vector<int> &luts_in_current_level = level_to_lut_indices.at(level);
 
-		// 1. 快速检查：尺寸必须是6和一个更小的
-		if (lut_6.size != 6 || lut_s.size >= 6)
-			return;
+		// --- 1. 并行化层内搜索 ---
+		// 使用一个临时的 vector 来收集所有线程的局部结果
+		vector<vector<MergeCandidate>> thread_local_results;
 
-		// 2. 检查输入子集关系
-		pool<SigBit> inputs_6, inputs_s;
-		for (const auto &p : lut_6.ordered_inputs)
-			inputs_6.insert(p.second);
-		for (const auto &p : lut_s.ordered_inputs)
-			inputs_s.insert(p.second);
+		#ifdef USE_OPENMP
+		#pragma omp parallel
+		#endif
+		{
+			// 【正确】在并行区域内声明私有变量
+			vector<MergeCandidate> local_candidates; 
 
-		bool is_subset = true;
-		for (const auto &sig_s : inputs_s) {
-			if (!inputs_6.count(sig_s)) {
-				is_subset = false;
-				break;
-			}
-		}
-		if (!is_subset)
-			return;
-
-		// 3. 检查逻辑关系
-		SigBit sel_bit;
-		if (CanLut6AbsorbLutS(lut_6, lut_s, sel_bit)) {
-			int score = 10000 + lut_s.size * 100;
-			candidates.push({idx_6, idx_s, score, inputs_6, MergeType::LUT6_ABSORB, sel_bit});
-		}
-	};
-
-	// --- 核心：分层搜索 ---
-	for (const auto &pair : level_to_lut_indices) {
-		int level = pair.first;
-		const vector<int> &luts_in_current_level = pair.second;
-
-		// --- 1. 在当前层内部进行搜索 ---
-		for (size_t i = 0; i < luts_in_current_level.size(); ++i) {
-			for (size_t j = i + 1; j < luts_in_current_level.size(); ++j) {
-				int lut_idx_a = luts_in_current_level[i];
-				int lut_idx_b = luts_in_current_level[j];
-
-				// 检查两种合并可能性
-				check_shared_inputs(lut_idx_a, lut_idx_b);
-				check_lut6_absorb(lut_idx_a, lut_idx_b); // 检查 a 是否能吸收 b
-				check_lut6_absorb(lut_idx_b, lut_idx_a); // 检查 b 是否能吸收 a
-			}
-		}
-
-		// --- 2. 与下一相邻层之间进行搜索 ---
-		if (level_to_lut_indices.count(level + 1)) {
-			const vector<int> &luts_in_next_level = level_to_lut_indices.at(level + 1);
-			for (int lut_idx_curr : luts_in_current_level) {
-				for (int lut_idx_next : luts_in_next_level) {
-					// 检查两种合并可能性
-					check_shared_inputs(lut_idx_curr, lut_idx_next);
-					check_lut6_absorb(lut_idx_curr, lut_idx_next); // 检查 curr 是否能吸收 next
-					check_lut6_absorb(lut_idx_next, lut_idx_curr); // 检查 next 是否能吸收 curr
+			// 【正确】让 OpenMP 自动将 i 的循环分配给各个线程
+			#ifdef USE_OPENMP
+			#pragma omp for schedule(dynamic) nowait
+			#endif
+			for (size_t i = 0; i < luts_in_current_level.size(); ++i) {
+				for (size_t j = i + 1; j < luts_in_current_level.size(); ++j) {
+                    // 调用 Lambda 时，直接传递局部容器
+					check_and_add_candidates(luts, luts_in_current_level[i], luts_in_current_level[j], local_candidates);
 				}
 			}
+
+            // 【正确】每个线程在完成自己的任务后，将自己的私有结果安全地汇总
+			#ifdef USE_OPENMP
+			#pragma omp critical
+			#endif
+			{
+				thread_local_results.push_back(std::move(local_candidates));
+			}
+		} // --- 并行区域结束 ---
+
+		// --- 2. 并行化层间搜索 ---
+        if (level_to_lut_indices.count(level + 1)) {
+            const vector<int> &luts_in_next_level = level_to_lut_indices.at(level + 1);
+			#ifdef USE_OPENMP
+			#pragma omp parallel
+			#endif
+            {
+                vector<MergeCandidate> local_candidates;
+                #pragma omp for schedule(dynamic) nowait
+                for (size_t i = 0; i < luts_in_current_level.size(); ++i) {
+                     for (size_t j = 0; j < luts_in_next_level.size(); ++j) {
+                        // 【修改】直接调用新的辅助函数
+                        check_and_add_candidates(luts, luts_in_current_level[i], luts_in_next_level[j], local_candidates);
+                    }
+                }
+				#ifdef USE_OPENMP
+				#pragma omp critical
+				#endif
+                {
+                    thread_local_results.push_back(std::move(local_candidates));
+                }
+            } // --- 并行区域结束 ---
+        }
+
+		// --- 3. 串行地将所有结果合并到全局优先队列 ---
+        for(const auto& vec : thread_local_results) {
+            for(const auto& cand : vec) {
+                candidates.push(cand);
+            }
+        }
+		
+		// 串行地进行超时检查
+		auto current_time = std::chrono::high_resolution_clock::now();
+		auto duration = std::chrono::duration<double>(current_time - start_time).count();
+		if (duration > SEARCH_TIMEOUT_SECONDS) {
+			timed_out = true;
 		}
+	}
+
+	if (timed_out) {
+		log_warning("Search in FindMergeCandidates_Layered timed out after %.1f seconds.\n", SEARCH_TIMEOUT_SECONDS);
 	}
 }
 
@@ -781,7 +864,6 @@ void StitcherMain(Module *module, const std::string &dump_filename)
 			NumberLutsByLevel(all_luts);
 
 			level_to_lut_indices.clear();
-			int max_level = 0;
 			for (size_t i = 0; i < all_luts.size(); ++i) {
 				RTLIL::Cell *cell_ptr = all_luts[i].cell_ptr;
 				if (lut_levels.count(cell_ptr)) {
