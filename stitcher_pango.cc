@@ -11,12 +11,38 @@
 #include <ranges>
 #include <string.h>
 #include <vector>
+#include <omp.h>
 
-//#define Layered //控制是否启用分层优化
+#define Layered // 控制是否启用分层优化
 
 USING_YOSYS_NAMESPACE
 using namespace std;
 PRIVATE_NAMESPACE_BEGIN
+
+// =================================================================
+// 计时辅助类
+// =================================================================
+class ScopedTimer
+{
+      public:
+	// 构造函数：记录起始时间并打印开始信息
+	ScopedTimer(const std::string &task_name) : task_name_(task_name), start_time_(std::chrono::high_resolution_clock::now())
+	{
+		log("\n--- Timing start: %s ---\n", task_name_.c_str());
+	}
+
+	// 析构函数：记录结束时间，计算差值，并打印结果
+	~ScopedTimer()
+	{
+		auto end_time = std::chrono::high_resolution_clock::now();
+		auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time_).count();
+		log("--- Timing end: %s | Duration: %.3f seconds ---\n", task_name_.c_str(), duration / 1000.0);
+	}
+
+      private:
+	std::string task_name_;
+	std::chrono::time_point<std::chrono::high_resolution_clock> start_time_;
+};
 
 // LutInfo 结构体保持不变
 struct LutInfo {
@@ -28,6 +54,10 @@ struct LutInfo {
 	RTLIL::Const init_val;
 	bool is_merged = false;
 };
+
+// 定义动态选择策略的阈值
+// 如果LUT总数超过这个值，就启用分层优化
+const size_t LAYERED_SEARCH_THRESHOLD = 30000;
 
 // 用于按层次存储LUT索引的地图
 map<int, vector<int>> level_to_lut_indices;
@@ -56,7 +86,7 @@ void NumberLutsByLevel(const vector<LutInfo> &luts)
 		lut_cell_pool.insert(lut.cell_ptr);
 		output_sig_to_lut[lut.output] = lut.cell_ptr;
 
-		lut_graph[lut.cell_ptr] = {}; 
+		lut_graph[lut.cell_ptr] = {};
 	}
 
 	for (const auto &src_lut : luts) {
@@ -454,9 +484,10 @@ struct MergeCandidate {
 };
 
 // 已添加分层逻辑
-#ifdef Layered
-void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
+void FindMergeCandidates_Layered(const vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
 {
+	log("Using layered search strategy (LUT count > %zu).\n", LAYERED_SEARCH_THRESHOLD);
+
 	// --- 辅助Lambda 1: 检查 SHARED_INPUTS 类型的合并 ---
 	auto check_shared_inputs = [&](int i, int j) {
 		const LutInfo &lut_a = luts[i];
@@ -543,11 +574,11 @@ void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandid
 		}
 	}
 }
-#endif
 
-#ifndef Layered
-void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
+void FindMergeCandidates_Global(const vector<LutInfo> &luts, priority_queue<MergeCandidate> &candidates)
 {
+	log("Using global search strategy (LUT count <= %zu).\n", LAYERED_SEARCH_THRESHOLD);
+
 	//  --- 第一部分：处理总输入 <= 5 的情况 (代码保持不变) ---
 	for (size_t i = 0; i < luts.size(); ++i) {
 		for (size_t j = i + 1; j < luts.size(); ++j) {
@@ -612,7 +643,6 @@ void FindMergeCandidates(const vector<LutInfo> &luts, priority_queue<MergeCandid
 		}
 	}
 }
-#endif
 
 // =================================================================
 // 步骤 3: 执行合并操作
@@ -707,82 +737,110 @@ vector<MergePlan> PlanMerges(Module *module, vector<LutInfo> &luts, priority_que
 // 合并流程
 void StitcherMain(Module *module, const std::string &dump_filename)
 {
-	// 计算用时
-	auto start_time = std::chrono::high_resolution_clock::now();
+	// --- 总计时器 ---
+	ScopedTimer total_timer("Total StitcherMain Execution");
 
-	// 将所有单输入的LUT读入内存
-	log("Step 1: Scanning and collecting all GTP_LUTs...\n");
-
-	// 建立信号关联数据库：将这些连接关系按 “逐位”（bit-by-bit）的方式记录到 SigMap 的内部数据库（database）中，形成一个全局的信号映射表。
-	SigMap sigmap(module);
+	// === 步骤 1: 收集LUTs ===
 	vector<LutInfo> all_luts;
-	// 遍历模块所有连接：扫描 module->connections() 中存储的所有信号连接关系（导线之间的连接、端口与内部信号的连接）
-	CollectLuts(module, sigmap, all_luts);
+	{ // 使用花括号创建一个新的作用域
+		ScopedTimer step1_timer("Step 1: CollectLuts");
+		SigMap sigmap(module);
+		CollectLuts(module, sigmap, all_luts);
 
-	if (!dump_filename.empty()) {
-		dump_luts_to_file(dump_filename, all_luts);
-	}
-
-	// --- 新增步骤：计算深度并分区 ---
-	NumberLutsByLevel(all_luts);
-
-	level_to_lut_indices.clear();
-	int max_level = 0;
-	for (size_t i = 0; i < all_luts.size(); ++i) {
-		RTLIL::Cell *cell_ptr = all_luts[i].cell_ptr;
-		if (lut_levels.count(cell_ptr)) {
-			int level = lut_levels.at(cell_ptr);
-			level_to_lut_indices[level].push_back(i);
-			if (level > max_level)
-				max_level = level;
+		if (!dump_filename.empty()) {
+			dump_luts_to_file(dump_filename, all_luts);
 		}
-	}
-	log("Partitioned LUTs into %d levels (from 0 to %d).\n", level_to_lut_indices.size(), max_level);
+	} // step1_timer 在这里离开作用域，自动打印时间
 
-	// 寻找合适的LUT对
-	log("Step 2: Finding best pairs to merge...\n");
+	log("Collected %zu LUTs.\n", all_luts.size());
+
+	// === 步骤 2: 计算深度并分区 ===
+
+	// === 【核心决策逻辑】 ===
 	priority_queue<MergeCandidate> candidates;
-	FindMergeCandidates(all_luts, candidates);
-	log("Found %zu potential merge candidates.\n", candidates.size());
 
-	// --- 阶段一: 规划合并方案 ---
-	vector<MergePlan> plans = PlanMerges(module, all_luts, candidates);
-	if (plans.empty()) {
-		log("No valid merges found.\n");
-		return;
-	}
-	log("Planned %zu merges.\n", plans.size());
+	if (all_luts.size() <= LAYERED_SEARCH_THRESHOLD) {
+		// --- 路径A：LUT数量少，使用快速的全局搜索 ---
 
-	// --- 阶段二: 执行合并方案 (安全的"先移除，后添加"策略) ---
-	pool<RTLIL::IdString> cell_names_to_remove;
-	// 将所有等待删除的旧LUT记录
-	for (const auto &plan : plans) {
-		cell_names_to_remove.insert(plan.cell_a_to_remove);
-		cell_names_to_remove.insert(plan.cell_b_to_remove);
-	}
-	// 遍历记录	调用API删除
-	for (auto cell_name : cell_names_to_remove) {
-		if (module->cell(cell_name)) {
-			module->remove(module->cell(cell_name));
+		// 分层是不必要的，但我们仍然可以打印一条信息
+		log("Skipping leveling/partitioning for small design.\n");
+
+		{
+			ScopedTimer step3_timer("Step 3: FindMergeCandidates (Global)");
+			FindMergeCandidates_Global(all_luts, candidates);
+			log("Found %zu potential merge candidates.\n", candidates.size());
+		}
+
+	} else {
+		// --- 路径B：LUT数量多，必须使用分层优化 ---
+
+		// === 步骤 2: 计算深度并分区 ===
+		int max_level = 0;
+		{
+			ScopedTimer step2_timer("Step 2: NumberLutsByLevel & Partition");
+			NumberLutsByLevel(all_luts);
+
+			level_to_lut_indices.clear();
+			int max_level = 0;
+			for (size_t i = 0; i < all_luts.size(); ++i) {
+				RTLIL::Cell *cell_ptr = all_luts[i].cell_ptr;
+				if (lut_levels.count(cell_ptr)) {
+					int level = lut_levels.at(cell_ptr);
+					level_to_lut_indices[level].push_back(i);
+					if (level > max_level)
+						max_level = level;
+				}
+			}
+
+			log("Partitioned LUTs into %zu levels (from 0 to %d).\n", level_to_lut_indices.size(), max_level);
+		}
+
+		// === 步骤 3: 寻找候选对 ===
+		{
+			ScopedTimer step3_timer("Step 3: FindMergeCandidates (Layered)");
+			FindMergeCandidates_Layered(all_luts, candidates);
+			log("Found %zu potential merge candidates.\n", candidates.size());
 		}
 	}
 
-	for (const auto &plan : plans) {
-		// 创建GTP_LUT6D
-		Cell *new_lut = module->addCell(plan.new_cell_name, ID(GTP_LUT6D));
-		// 设置真值表
-		new_lut->setParam(ID::INIT, plan.init_val);
-		// 设置新的输入，输出
-		for (const auto &conn : plan.port_connections) {
-			new_lut->setPort(conn.first, conn.second);
+	// === 步骤 4: 规划合并方案 ===
+	vector<MergePlan> plans;
+	{
+		ScopedTimer step4_timer("Step 4: PlanMerges");
+		plans = PlanMerges(module, all_luts, candidates);
+		if (plans.empty()) {
+			log("No valid merges found.\n");
+			// 函数提前结束，total_timer 会自动析构并打印总时间
+			return;
 		}
+		log("Planned %zu merges.\n", plans.size());
 	}
-	// 输出合并成功的数量
-	log("Performed %zu merges successfully.\n", plans.size());
-	// 计算并输出总耗时
-	auto end_time = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double, std::milli> elapsed_ms = end_time - start_time;
-	log("Whole process took %.2f ms.\n", elapsed_ms.count());
+
+	// === 步骤 5: 执行合并方案 ===
+	{
+		ScopedTimer step5_timer("Step 5: ExecuteMerges (remove & add cells)");
+		pool<RTLIL::IdString> cell_names_to_remove;
+		for (const auto &plan : plans) {
+			cell_names_to_remove.insert(plan.cell_a_to_remove);
+			cell_names_to_remove.insert(plan.cell_b_to_remove);
+		}
+		for (auto cell_name : cell_names_to_remove) {
+			if (module->cell(cell_name)) {
+				module->remove(module->cell(cell_name));
+			}
+		}
+
+		for (const auto &plan : plans) {
+			Cell *new_lut = module->addCell(plan.new_cell_name, ID(GTP_LUT6D));
+			new_lut->setParam(ID::INIT, plan.init_val);
+			for (const auto &conn : plan.port_connections) {
+				new_lut->setPort(conn.first, conn.second);
+			}
+		}
+		log("Performed %zu merges successfully.\n", plans.size());
+	}
+
+	// total_timer 在函数末尾离开作用域，自动打印总时间
 }
 
 // 命令注册
