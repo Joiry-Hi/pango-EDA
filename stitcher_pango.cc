@@ -13,7 +13,7 @@
 #include <string.h>
 #include <vector>
 
-#define Layered // 控制是否启用分层优化
+#define Layered	   // 控制是否启用分层优化
 #define USE_OPENMP // 控制是否开启并行优化
 
 USING_YOSYS_NAMESPACE
@@ -22,9 +22,9 @@ PRIVATE_NAMESPACE_BEGIN
 
 // 定义动态选择策略的阈值
 // 如果LUT总数超过这个值，就启用分层优化
-const size_t LAYERED_SEARCH_THRESHOLD = 20000;
+const size_t LAYERED_SEARCH_THRESHOLD = 30000;
 
-const double SEARCH_TIMEOUT_SECONDS = 300.0; //控制单个搜索进程的超时退出阈值（虽然并行化后没啥必要了）
+const double SEARCH_TIMEOUT_SECONDS = 300.0; // 控制单个搜索进程的超时退出阈值（虽然并行化后没啥必要了）
 
 // =================================================================
 // 计时辅助类
@@ -485,78 +485,73 @@ struct MergeCandidate {
 // =================================================================
 // 新的、独立的辅助函数，用于检查一对LUT的所有合并可能性
 // =================================================================
-void check_and_add_candidates(
-    const vector<LutInfo>& luts, 
-    int idx_a, 
-    int idx_b, 
-    vector<MergeCandidate>& local_candidates
-)
+void check_and_add_candidates(const vector<LutInfo> &luts, int idx_a, int idx_b, vector<MergeCandidate> &local_candidates)
 {
-    const LutInfo &lut_a = luts[idx_a];
-    const LutInfo &lut_b = luts[idx_b];
+	const LutInfo &lut_a = luts[idx_a];
+	const LutInfo &lut_b = luts[idx_b];
 
-    // --- 逻辑 1: 检查 SHARED_INPUTS 类型的合并 (来自旧的 check_shared_inputs) ---
-    pool<SigBit> current_union_inputs;
-    for (const auto &pair : lut_a.ordered_inputs)
-        current_union_inputs.insert(pair.second);
-    for (const auto &pair : lut_b.ordered_inputs)
-        current_union_inputs.insert(pair.second);
+	// --- 逻辑 1: 检查 SHARED_INPUTS 类型的合并 (来自旧的 check_shared_inputs) ---
+	pool<SigBit> current_union_inputs;
+	for (const auto &pair : lut_a.ordered_inputs)
+		current_union_inputs.insert(pair.second);
+	for (const auto &pair : lut_b.ordered_inputs)
+		current_union_inputs.insert(pair.second);
 
-    if (current_union_inputs.size() <= 5) {
-        int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
-        if (shared_inputs >= 1) {
-            int score = shared_inputs * 100 - current_union_inputs.size();
-            local_candidates.push_back({idx_a, idx_b, score, current_union_inputs, MergeType::SHARED_INPUTS, RTLIL::Sx});
-        }
-    }
+	if (current_union_inputs.size() <= 5) {
+		int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
+		if (shared_inputs >= 1) {
+			int score = shared_inputs * 100 - current_union_inputs.size();
+			local_candidates.push_back({idx_a, idx_b, score, current_union_inputs, MergeType::SHARED_INPUTS, RTLIL::Sx});
+		}
+	}
 
-    // --- 逻辑 2: 检查 LUT6_ABSORB 类型的合并 (来自旧的 check_lut6_absorb) ---
-    
-    // 可能性 A: a 吸收 b
-    if (lut_a.size == 6 && lut_b.size < 6) {
-        pool<SigBit> inputs_a;
-		for (const auto &p : lut_a.ordered_inputs) inputs_a.insert(p.second);
-        
-        // 检查输入子集关系
-        bool is_subset = true;
-        for (const auto &p_b : lut_b.ordered_inputs) {
-            if (!inputs_a.count(p_b.second)) {
-                is_subset = false;
-                break;
-            }
-        }
+	// // --- 逻辑 2: 检查 LUT6_ABSORB 类型的合并 (来自旧的 check_lut6_absorb) ---
 
-        if (is_subset) {
-            SigBit sel_bit;
-            if (CanLut6AbsorbLutS(lut_a, lut_b, sel_bit)) {
-                int score = 10000 + lut_b.size * 100;
-                local_candidates.push_back({idx_a, idx_b, score, inputs_a, MergeType::LUT6_ABSORB, sel_bit});
-            }
-        }
-    }
+	// // 可能性 A: a 吸收 b
+	// if (lut_a.size == 6 && lut_b.size < 6) {
+	//     pool<SigBit> inputs_a;
+	// 	for (const auto &p : lut_a.ordered_inputs) inputs_a.insert(p.second);
 
-    // 可能性 B: b 吸收 a
-    if (lut_b.size == 6 && lut_a.size < 6) {
-        pool<SigBit> inputs_b;
-		for (const auto &p : lut_b.ordered_inputs) inputs_b.insert(p.second);
+	//     // 检查输入子集关系
+	//     bool is_subset = true;
+	//     for (const auto &p_b : lut_b.ordered_inputs) {
+	//         if (!inputs_a.count(p_b.second)) {
+	//             is_subset = false;
+	//             break;
+	//         }
+	//     }
 
-        // 检查输入子集关系
-        bool is_subset = true;
-        for (const auto &p_a : lut_a.ordered_inputs) {
-            if (!inputs_b.count(p_a.second)) {
-                is_subset = false;
-                break;
-            }
-        }
-        
-        if (is_subset) {
-            SigBit sel_bit;
-            if (CanLut6AbsorbLutS(lut_b, lut_a, sel_bit)) {
-                int score = 10000 + lut_a.size * 100;
-                local_candidates.push_back({idx_b, idx_a, score, inputs_b, MergeType::LUT6_ABSORB, sel_bit});
-            }
-        }
-    }
+	//     if (is_subset) {
+	//         SigBit sel_bit;
+	//         if (CanLut6AbsorbLutS(lut_a, lut_b, sel_bit)) {
+	//             int score = 10000 + lut_b.size * 100;
+	//             local_candidates.push_back({idx_a, idx_b, score, inputs_a, MergeType::LUT6_ABSORB, sel_bit});
+	//         }
+	//     }
+	// }
+
+	// // 可能性 B: b 吸收 a
+	// if (lut_b.size == 6 && lut_a.size < 6) {
+	//     pool<SigBit> inputs_b;
+	// 	for (const auto &p : lut_b.ordered_inputs) inputs_b.insert(p.second);
+
+	//     // 检查输入子集关系
+	//     bool is_subset = true;
+	//     for (const auto &p_a : lut_a.ordered_inputs) {
+	//         if (!inputs_b.count(p_a.second)) {
+	//             is_subset = false;
+	//             break;
+	//         }
+	//     }
+
+	//     if (is_subset) {
+	//         SigBit sel_bit;
+	//         if (CanLut6AbsorbLutS(lut_b, lut_a, sel_bit)) {
+	//             int score = 10000 + lut_a.size * 100;
+	//             local_candidates.push_back({idx_b, idx_a, score, inputs_b, MergeType::LUT6_ABSORB, sel_bit});
+	//         }
+	//     }
+	// }
 }
 
 // 已添加多线程并行功能
@@ -578,8 +573,10 @@ void FindMergeCandidates_Layered(const vector<LutInfo> &luts, priority_queue<Mer
 
 	// 串行地遍历每一个 level
 	for (int level = 0; level <= max_level; ++level) {
-		if (timed_out) break;
-		if (!level_to_lut_indices.count(level)) continue;
+		if (timed_out)
+			break;
+		if (!level_to_lut_indices.count(level))
+			continue;
 
 		const vector<int> &luts_in_current_level = level_to_lut_indices.at(level);
 
@@ -587,64 +584,64 @@ void FindMergeCandidates_Layered(const vector<LutInfo> &luts, priority_queue<Mer
 		// 使用一个临时的 vector 来收集所有线程的局部结果
 		vector<vector<MergeCandidate>> thread_local_results;
 
-		#ifdef USE_OPENMP
-		#pragma omp parallel
-		#endif
+#ifdef USE_OPENMP
+#pragma omp parallel
+#endif
 		{
 			// 【正确】在并行区域内声明私有变量
-			vector<MergeCandidate> local_candidates; 
+			vector<MergeCandidate> local_candidates;
 
-			// 【正确】让 OpenMP 自动将 i 的循环分配给各个线程
-			#ifdef USE_OPENMP
-			#pragma omp for schedule(dynamic) nowait
-			#endif
+// 【正确】让 OpenMP 自动将 i 的循环分配给各个线程
+#ifdef USE_OPENMP
+#pragma omp for schedule(dynamic) nowait
+#endif
 			for (size_t i = 0; i < luts_in_current_level.size(); ++i) {
 				for (size_t j = i + 1; j < luts_in_current_level.size(); ++j) {
-                    // 调用 Lambda 时，直接传递局部容器
+					// 调用 Lambda 时，直接传递局部容器
 					check_and_add_candidates(luts, luts_in_current_level[i], luts_in_current_level[j], local_candidates);
 				}
 			}
 
-            // 【正确】每个线程在完成自己的任务后，将自己的私有结果安全地汇总
-			#ifdef USE_OPENMP
-			#pragma omp critical
-			#endif
+			// 【正确】每个线程在完成自己的任务后，将自己的私有结果安全地汇总
+#ifdef USE_OPENMP
+#pragma omp critical
+#endif
 			{
 				thread_local_results.push_back(std::move(local_candidates));
 			}
 		} // --- 并行区域结束 ---
 
 		// --- 2. 并行化层间搜索 ---
-        if (level_to_lut_indices.count(level + 1)) {
-            const vector<int> &luts_in_next_level = level_to_lut_indices.at(level + 1);
-			#ifdef USE_OPENMP
-			#pragma omp parallel
-			#endif
-            {
-                vector<MergeCandidate> local_candidates;
-                #pragma omp for schedule(dynamic) nowait
-                for (size_t i = 0; i < luts_in_current_level.size(); ++i) {
-                     for (size_t j = 0; j < luts_in_next_level.size(); ++j) {
-                        // 【修改】直接调用新的辅助函数
-                        check_and_add_candidates(luts, luts_in_current_level[i], luts_in_next_level[j], local_candidates);
-                    }
-                }
-				#ifdef USE_OPENMP
-				#pragma omp critical
-				#endif
-                {
-                    thread_local_results.push_back(std::move(local_candidates));
-                }
-            } // --- 并行区域结束 ---
-        }
+		if (level_to_lut_indices.count(level + 1)) {
+			const vector<int> &luts_in_next_level = level_to_lut_indices.at(level + 1);
+#ifdef USE_OPENMP
+#pragma omp parallel
+#endif
+			{
+				vector<MergeCandidate> local_candidates;
+#pragma omp for schedule(dynamic) nowait
+				for (size_t i = 0; i < luts_in_current_level.size(); ++i) {
+					for (size_t j = 0; j < luts_in_next_level.size(); ++j) {
+						// 【修改】直接调用新的辅助函数
+						check_and_add_candidates(luts, luts_in_current_level[i], luts_in_next_level[j], local_candidates);
+					}
+				}
+#ifdef USE_OPENMP
+#pragma omp critical
+#endif
+				{
+					thread_local_results.push_back(std::move(local_candidates));
+				}
+			} // --- 并行区域结束 ---
+		}
 
 		// --- 3. 串行地将所有结果合并到全局优先队列 ---
-        for(const auto& vec : thread_local_results) {
-            for(const auto& cand : vec) {
-                candidates.push(cand);
-            }
-        }
-		
+		for (const auto &vec : thread_local_results) {
+			for (const auto &cand : vec) {
+				candidates.push(cand);
+			}
+		}
+
 		// 串行地进行超时检查
 		auto current_time = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration<double>(current_time - start_time).count();
@@ -677,54 +674,52 @@ void FindMergeCandidates_Global(const vector<LutInfo> &luts, priority_queue<Merg
 
 			int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
 
-			if (current_union_inputs.size() <= 6 && shared_inputs <= 5) {
-				if (current_union_inputs.size() <= 6) {
-					// 计算分数：共享输入数 * 100 - 总输入数
-					int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
-					int score = shared_inputs * 100 - current_union_inputs.size();
-					candidates.push({(int)i, (int)j, score, current_union_inputs, MergeType::SHARED_INPUTS, RTLIL::Sx});
-				}
+			if (current_union_inputs.size() <= 5 && shared_inputs >= 1) {
+				// 计算分数：共享输入数 * 100 - 总输入数
+				int shared_inputs = (lut_a.size + lut_b.size) - current_union_inputs.size();
+				int score = shared_inputs * 100 - current_union_inputs.size();
+				candidates.push({(int)i, (int)j, score, current_union_inputs, MergeType::SHARED_INPUTS, RTLIL::Sx});
 			}
 		}
 	}
-	//	--- 第二部分：处理 LUT6 吸收小 LUT 的情况 ---
-	for (size_t i = 0; i < luts.size(); ++i) {
-		if (luts[i].size != 6)
-			continue; // 只从 LUT6 开始
-		const LutInfo &lut_6 = luts[i];
+	// //	--- 第二部分：处理 LUT6 吸收小 LUT 的情况 ---
+	// for (size_t i = 0; i < luts.size(); ++i) {
+	// 	if (luts[i].size != 6)
+	// 		continue; // 只从 LUT6 开始
+	// 	const LutInfo &lut_6 = luts[i];
 
-		for (size_t j = 0; j < luts.size(); ++j) {
-			if (i == j)
-				continue;
-			const LutInfo &lut_s = luts[j];
+	// 	for (size_t j = 0; j < luts.size(); ++j) {
+	// 		if (i == j)
+	// 			continue;
+	// 		const LutInfo &lut_s = luts[j];
 
-			// 1. 检查输入子集关系
-			pool<SigBit> inputs_6, inputs_s;
-			for (const auto &p : lut_6.ordered_inputs)
-				inputs_6.insert(p.second);
-			for (const auto &p : lut_s.ordered_inputs)
-				inputs_s.insert(p.second);
+	// 		// 1. 检查输入子集关系
+	// 		pool<SigBit> inputs_6, inputs_s;
+	// 		for (const auto &p : lut_6.ordered_inputs)
+	// 			inputs_6.insert(p.second);
+	// 		for (const auto &p : lut_s.ordered_inputs)
+	// 			inputs_s.insert(p.second);
 
-			bool is_subset = true;
-			for (const auto &sig_s : inputs_s) {
-				if (!inputs_6.count(sig_s)) {
-					is_subset = false;
-					break;
-				}
-			}
-			if (!is_subset)
-				continue;
+	// 		bool is_subset = true;
+	// 		for (const auto &sig_s : inputs_s) {
+	// 			if (!inputs_6.count(sig_s)) {
+	// 				is_subset = false;
+	// 				break;
+	// 			}
+	// 		}
+	// 		if (!is_subset)
+	// 			continue;
 
-			// 2. 检查逻辑关系 (调用新的辅助函数)
-			SigBit sel_bit;
-			if (CanLut6AbsorbLutS(lut_6, lut_s, sel_bit)) {
-				// 这是一个完美的吸收机会！
-				// 给予极高的分数，确保优先处理
-				int score = 10000 + lut_s.size * 100;
-				candidates.push({(int)i, (int)j, score, inputs_6, MergeType::LUT6_ABSORB, sel_bit});
-			}
-		}
-	}
+	// 		// 2. 检查逻辑关系 (调用新的辅助函数)
+	// 		SigBit sel_bit;
+	// 		if (CanLut6AbsorbLutS(lut_6, lut_s, sel_bit)) {
+	// 			// 这是一个完美的吸收机会！
+	// 			// 给予极高的分数，确保优先处理
+	// 			int score = 10000 + lut_s.size * 100;
+	// 			candidates.push({(int)i, (int)j, score, inputs_6, MergeType::LUT6_ABSORB, sel_bit});
+	// 		}
+	// 	}
+	// }
 }
 
 // =================================================================
