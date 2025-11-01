@@ -22,7 +22,7 @@ PRIVATE_NAMESPACE_BEGIN
 
 // 定义动态选择策略的阈值
 // 如果LUT总数超过这个值，就启用分层优化
-const size_t LAYERED_SEARCH_THRESHOLD = 30000;
+const size_t LAYERED_SEARCH_THRESHOLD = 20000;
 
 const double SEARCH_TIMEOUT_SECONDS = 300.0; // 控制单个搜索进程的超时退出阈值（虽然并行化后没啥必要了）
 
@@ -480,6 +480,21 @@ struct MergeCandidate {
 	SigBit discovered_sel_bit; // 仅在 LUT6_ABSORB 类型下有效
 
 	bool operator<(const MergeCandidate &other) const { return score < other.score; }
+
+	// 稳定排序的比较函数
+	// 首先按分数（score）降序排
+	// 如果分数相同，则按 idx_a 升序排
+	// 如果 idx_a 还相同，则按 idx_b 升序排
+	static bool compareCandidates(const MergeCandidate &a, const MergeCandidate & b)
+	{
+		if (a.score != b.score) {
+			return a.score > b.score;
+		}
+		if (a.idx_a != b.idx_a) {
+			return a.idx_a < b.idx_a;
+		}
+		return a.idx_b < b.idx_b;
+	}
 };
 
 // =================================================================
@@ -571,6 +586,9 @@ void FindMergeCandidates_Layered(const vector<LutInfo> &luts, priority_queue<Mer
 		max_level = level_to_lut_indices.rbegin()->first;
 	}
 
+	// 【修改】创建一个临时的 vector 来收集所有线程的结果
+	vector<vector<MergeCandidate>> all_thread_local_results;
+
 	// 串行地遍历每一个 level
 	for (int level = 0; level <= max_level; ++level) {
 		if (timed_out)
@@ -580,36 +598,28 @@ void FindMergeCandidates_Layered(const vector<LutInfo> &luts, priority_queue<Mer
 
 		const vector<int> &luts_in_current_level = level_to_lut_indices.at(level);
 
-		// --- 1. 并行化层内搜索 ---
-		// 使用一个临时的 vector 来收集所有线程的局部结果
-		vector<vector<MergeCandidate>> thread_local_results;
-
+// --- 1. 并行化层内搜索 ---
 #ifdef USE_OPENMP
 #pragma omp parallel
 #endif
 		{
-			// 【正确】在并行区域内声明私有变量
 			vector<MergeCandidate> local_candidates;
-
-// 【正确】让 OpenMP 自动将 i 的循环分配给各个线程
 #ifdef USE_OPENMP
 #pragma omp for schedule(dynamic) nowait
 #endif
 			for (size_t i = 0; i < luts_in_current_level.size(); ++i) {
 				for (size_t j = i + 1; j < luts_in_current_level.size(); ++j) {
-					// 调用 Lambda 时，直接传递局部容器
 					check_and_add_candidates(luts, luts_in_current_level[i], luts_in_current_level[j], local_candidates);
 				}
 			}
-
-			// 【正确】每个线程在完成自己的任务后，将自己的私有结果安全地汇总
 #ifdef USE_OPENMP
 #pragma omp critical
 #endif
 			{
-				thread_local_results.push_back(std::move(local_candidates));
+				// 收集每个线程的私有结果，使用 move 提高效率
+				all_thread_local_results.push_back(std::move(local_candidates));
 			}
-		} // --- 并行区域结束 ---
+		}
 
 		// --- 2. 并行化层间搜索 ---
 		if (level_to_lut_indices.count(level + 1)) {
@@ -619,10 +629,11 @@ void FindMergeCandidates_Layered(const vector<LutInfo> &luts, priority_queue<Mer
 #endif
 			{
 				vector<MergeCandidate> local_candidates;
+#ifdef USE_OPENMP
 #pragma omp for schedule(dynamic) nowait
+#endif
 				for (size_t i = 0; i < luts_in_current_level.size(); ++i) {
 					for (size_t j = 0; j < luts_in_next_level.size(); ++j) {
-						// 【修改】直接调用新的辅助函数
 						check_and_add_candidates(luts, luts_in_current_level[i], luts_in_next_level[j], local_candidates);
 					}
 				}
@@ -630,13 +641,13 @@ void FindMergeCandidates_Layered(const vector<LutInfo> &luts, priority_queue<Mer
 #pragma omp critical
 #endif
 				{
-					thread_local_results.push_back(std::move(local_candidates));
+					all_thread_local_results.push_back(std::move(local_candidates));
 				}
-			} // --- 并行区域结束 ---
+			}
 		}
 
 		// --- 3. 串行地将所有结果合并到全局优先队列 ---
-		for (const auto &vec : thread_local_results) {
+		for (const auto &vec : all_thread_local_results) {
 			for (const auto &cand : vec) {
 				candidates.push(cand);
 			}
@@ -648,6 +659,26 @@ void FindMergeCandidates_Layered(const vector<LutInfo> &luts, priority_queue<Mer
 		if (duration > SEARCH_TIMEOUT_SECONDS) {
 			timed_out = true;
 		}
+	}
+
+	// --- 【核心修改：串行的、确定的排序和填充阶段】 ---
+	log("Parallel search finished. Starting deterministic sorting and merging of results...\n");
+
+	// 1. 将所有线程的结果合并到一个大的 vector 中
+	vector<MergeCandidate> all_candidates;
+	for (const auto &vec : all_thread_local_results) {
+		all_candidates.insert(all_candidates.end(), vec.begin(), vec.end());
+	}
+	log("Total candidates found by all threads: %zu\n", all_candidates.size());
+
+	// 2. 对这个大的 vector 进行全局的、稳定的排序
+	// 注意：std::sort 不是稳定的，但配合我们自定义的、能处理所有情况的比较函数，
+	// 它能产生一个确定性的顺序。
+	std::sort(all_candidates.begin(), all_candidates.end(), MergeCandidate::compareCandidates);
+
+	// 3. 将排序后的结果，按确定顺序 push 到最终的优先队列中
+	for (const auto &cand : all_candidates) {
+		candidates.push(cand);
 	}
 
 	if (timed_out) {
